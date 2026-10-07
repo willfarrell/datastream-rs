@@ -8,7 +8,7 @@ repository.workspace = true
 
 [dependencies]
 async-stream.workspace = true
-base64 = "0.22"
+base64 = "0.23"
 datastream-core.workspace = true
 
 [dev-dependencies]
