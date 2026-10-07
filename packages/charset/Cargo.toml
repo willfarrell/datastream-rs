@@ -8,7 +8,7 @@ repository.workspace = true
 
 [dependencies]
 async-stream.workspace = true
-chardetng = "0.1"
+chardetng = "1.0"
 datastream-core.workspace = true
 encoding_rs = "0.8"
 serde_json.workspace = true
