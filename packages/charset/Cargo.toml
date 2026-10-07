@@ -1,0 +1,23 @@
+[package]
+name = "datastream-charset"
+description = "Character encoding detection, decoding, and conversion streams"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+async-stream.workspace = true
+chardetng = "0.1"
+datastream-core.workspace = true
+encoding_rs = "0.8"
+serde_json.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+proptest.workspace = true
+tokio.workspace = true
+
+[[bench]]
+name = "index"
+harness = false

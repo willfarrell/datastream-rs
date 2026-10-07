@@ -1,0 +1,22 @@
+[package]
+name = "datastream-string"
+description = "String manipulation streams"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+async-stream.workspace = true
+datastream-core.workspace = true
+regex = "1"
+serde_json.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+proptest.workspace = true
+tokio.workspace = true
+
+[[bench]]
+name = "index"
+harness = false

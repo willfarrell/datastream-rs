@@ -1,0 +1,43 @@
+# cargo-deny: https://embarkstudios.github.io/cargo-deny/
+[graph]
+all-features = false
+
+[advisories]
+# Fail on unmaintained direct dependencies only; transitive ones are upstream's call.
+unmaintained = "workspace"
+
+[licenses]
+# Kept in sync with the JS list even where no crate uses it yet.
+unused-allowed-license = "allow"
+# The JS repo's trivy allow-list, plus permissive licenses common in Rust
+# crates: CDLA-Permissive-2.0 (webpki-roots), MIT-0, Unicode-3.0 (ICU,
+# unicode-ident), Zlib.
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "BSD-1-Clause",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BlueOak-1.0.0",
+    "CC0-1.0",
+    "CC-BY-4.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "LGPL-3.0-or-later",
+    "MIT",
+    "MIT-0",
+    "MPL-2.0",
+    "Python-2.0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+
+[bans]
+multiple-versions = "allow"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

@@ -1,0 +1,23 @@
+[package]
+name = "datastream-arrow"
+description = "Apache Arrow record batch transform streams"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+arrow-array = "60"
+arrow-schema = "60"
+async-stream.workspace = true
+datastream-core.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+proptest.workspace = true
+tokio.workspace = true
+
+[[bench]]
+name = "index"
+harness = false

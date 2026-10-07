@@ -1,0 +1,24 @@
+---
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    cooldown:
+      default-days: 14
+    groups:
+      everything:
+        patterns:
+          - "*"
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    cooldown:
+      default-days: 14
+    ignore:
+      # 0.16+ pins a beta azure_core that conflicts with azure_storage_* and
+      # azure_data_cosmos. Drop this once they share an azure_core release.
+      - dependency-name: "azure_messaging_eventhubs"
+        versions: [">=0.16"]

@@ -1,0 +1,75 @@
+[package]
+name = "datastream-aws"
+description = "AWS service streams for CloudWatch Logs, DynamoDB, DynamoDB Streams, Kinesis, Lambda, S3, SNS, and SQS"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = [
+    "cloudwatch-logs",
+    "dynamodb",
+    "dynamodb-streams",
+    "glue-schema-registry",
+    "kinesis",
+    "lambda",
+    "msk-iam",
+    "s3",
+    "sns",
+    "sqs",
+]
+cloudwatch-logs = ["dep:aws-sdk-cloudwatchlogs"]
+dynamodb = ["dep:aws-sdk-dynamodb"]
+dynamodb-streams = ["dep:aws-sdk-dynamodbstreams"]
+glue-schema-registry = ["dep:aws-sdk-glue"]
+kinesis = ["dep:aws-sdk-kinesis"]
+lambda = ["dep:aws-sdk-lambda"]
+msk-iam = ["dep:aws-credential-types", "dep:aws-sigv4"]
+s3 = ["dep:aws-sdk-s3", "dep:sha1", "dep:sha2"]
+sns = ["dep:aws-sdk-sns"]
+sqs = ["dep:aws-sdk-sqs"]
+
+[dependencies]
+# aws-sdk-* default features minus `rustls`, which pulls the legacy hyper 0.14 /
+# rustls 0.21 client (h2 0.3, rustls-webpki 0.101 advisories).
+async-stream.workspace = true
+aws-credential-types = { version = "1", optional = true }
+aws-sdk-cloudwatchlogs = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"], optional = true }
+aws-sdk-dynamodb = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"], optional = true }
+aws-sdk-dynamodbstreams = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"], optional = true }
+aws-sdk-glue = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"], optional = true }
+aws-sdk-kinesis = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"], optional = true }
+aws-sdk-lambda = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"], optional = true }
+aws-sdk-s3 = { version = "1", default-features = false, features = ["default-https-client", "http-1x", "rt-tokio", "sigv4a"], optional = true }
+aws-sdk-sns = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"], optional = true }
+aws-sdk-sqs = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"], optional = true }
+aws-sigv4 = { version = "1", features = ["sign-http"], optional = true }
+aws-smithy-types = "1"
+datastream-core.workspace = true
+futures.workspace = true
+serde_json.workspace = true
+sha1 = { version = "0.10", optional = true }
+sha2 = { version = "0.10", optional = true }
+tokio.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+proptest.workspace = true
+aws-sdk-cloudwatchlogs = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio", "test-util"] }
+aws-sdk-dynamodb = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio", "test-util"] }
+aws-sdk-dynamodbstreams = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio", "test-util"] }
+aws-sdk-glue = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio", "test-util"] }
+aws-sdk-kinesis = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio", "test-util"] }
+aws-sdk-lambda = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio", "test-util"] }
+aws-sdk-s3 = { version = "1", default-features = false, features = ["default-https-client", "http-1x", "rt-tokio", "sigv4a", "test-util"] }
+aws-sdk-sns = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio", "test-util"] }
+aws-sdk-sqs = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio", "test-util"] }
+aws-smithy-eventstream = "0.61"
+aws-smithy-mocks = "0.3"
+aws-smithy-runtime-api = "1"
+tokio = { workspace = true, features = ["test-util"] }
+
+[[bench]]
+name = "index"
+harness = false

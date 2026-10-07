@@ -1,0 +1,22 @@
+[package]
+name = "datastream-protobuf"
+description = "Protocol Buffers encode/decode and length-prefix framing streams"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+async-stream.workspace = true
+datastream-core.workspace = true
+prost-reflect = { version = "0.16", features = ["serde"] }
+serde_json.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+proptest.workspace = true
+tokio.workspace = true
+
+[[bench]]
+name = "index"
+harness = false

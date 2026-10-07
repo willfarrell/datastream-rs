@@ -1,0 +1,37 @@
+[package]
+name = "datastream-azure"
+description = "Azure service streams for Blob Storage, Queue Storage, Event Hubs, and Cosmos DB"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = ["blob", "cosmos", "event-hubs", "event-hubs-kafka", "queue"]
+blob = ["dep:azure_storage_blob"]
+cosmos = ["dep:azure_data_cosmos"]
+event-hubs = ["dep:azure_messaging_eventhubs"]
+event-hubs-kafka = []
+queue = ["dep:azure_storage_queue"]
+
+[dependencies]
+async-stream.workspace = true
+azure_core = "1.1"
+azure_data_cosmos = { version = "0.38", optional = true }
+azure_messaging_eventhubs = { version = "0.15", optional = true }
+azure_storage_blob = { version = "1.1", optional = true }
+azure_storage_queue = { version = "1.1", optional = true }
+datastream-core.workspace = true
+futures.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+proptest.workspace = true
+async-trait = "0.1"
+tokio = { workspace = true, features = ["test-util"] }
+
+[[bench]]
+name = "index"
+harness = false

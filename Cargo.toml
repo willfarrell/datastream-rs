@@ -1,0 +1,20 @@
+[workspace]
+resolver = "2"
+members = ["packages/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/willfarrell/datastream-rs"
+
+[workspace.dependencies]
+datastream-core = { path = "packages/core", version = "0.1.0" }
+datastream-object = { path = "packages/object", version = "0.1.0" }
+async-stream = "0.3"
+futures = "0.3"
+serde_json = { version = "1", features = ["preserve_order"] }
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+criterion = { version = "0.8", features = ["async_tokio"] }
+proptest = "1"

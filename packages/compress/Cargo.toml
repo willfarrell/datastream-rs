@@ -1,0 +1,23 @@
+[package]
+name = "datastream-compress"
+description = "Compression streams for gzip, brotli, zstd, and deflate"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+async-stream.workspace = true
+brotli = "8"
+datastream-core.workspace = true
+flate2 = "1"
+zstd = "0.13"
+
+[dev-dependencies]
+criterion.workspace = true
+proptest.workspace = true
+tokio.workspace = true
+
+[[bench]]
+name = "index"
+harness = false

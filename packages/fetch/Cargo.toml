@@ -1,0 +1,25 @@
+[package]
+name = "datastream-fetch"
+description = "HTTP fetch readable and writable streams"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+async-stream.workspace = true
+datastream-core.workspace = true
+futures.workspace = true
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "gzip", "brotli", "deflate"] }
+serde_json.workspace = true
+tokio.workspace = true
+url = "2"
+
+[dev-dependencies]
+criterion.workspace = true
+proptest.workspace = true
+wiremock = "0.6"
+
+[[bench]]
+name = "index"
+harness = false

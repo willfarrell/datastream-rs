@@ -1,0 +1,109 @@
+name: Tests (mutation)
+
+on:
+  pull_request:
+  schedule:
+    - cron: "17 4 * * 6"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Every mutant reruns the tests; keep the property tests short.
+  PROPTEST_CASES: 32
+
+jobs:
+  setup:
+    name: List packages
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      packages: ${{ steps.list.outputs.packages }}
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: block
+          disable-sudo: true
+          disable-telemetry: true
+          allowed-endpoints: >
+            github.com:443
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: List packages
+        id: list
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          all() { find packages -maxdepth 1 -mindepth 1 -type d -printf '%f\n'; }
+          if [ -z "$BASE_REF" ]; then
+            packages=$(all)
+          else
+            git fetch --no-tags --depth=1 origin "$BASE_REF"
+            changed=$(git diff --name-only FETCH_HEAD HEAD)
+            if echo "$changed" | grep -qE '^(Cargo\.(toml|lock)|\.github/workflows/test-mutation\.yml)$'; then
+              packages=$(all)
+            else
+              packages=$(echo "$changed" | grep -E '^packages/[^/]+/' | cut -d/ -f2 | sort -u)
+            fi
+          fi
+          echo "packages=$(echo "$packages" | jq -R -s -c 'split("\n") | map(select(length > 0))')" >> "$GITHUB_OUTPUT"
+
+  mutation:
+    name: Tests (mutation, ${{ matrix.package }})
+    needs: setup
+    if: needs.setup.outputs.packages != '[]'
+    runs-on: ubuntu-latest
+    # Pull requests only mutate changed lines; the weekly run mutates everything.
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        package: ${{ fromJson(needs.setup.outputs.packages) }}
+
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: block
+          disable-sudo: true
+          disable-telemetry: true
+          allowed-endpoints: >
+            api.github.com:443
+            github.com:443
+            index.crates.io:443
+            static.crates.io:443
+            static.rust-lang.org:443
+            objects.githubusercontent.com:443
+            release-assets.githubusercontent.com:443
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Setup Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - name: Install cargo-mutants
+        uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
+        with:
+          tool: cargo-mutants
+      - name: Mutation tests
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          PACKAGE: ${{ matrix.package }}
+        run: |
+          if [ -n "$BASE_REF" ]; then
+            git fetch --no-tags --depth=1 origin "$BASE_REF"
+            git diff FETCH_HEAD HEAD > "$RUNNER_TEMP/pr.diff"
+            set -- --in-diff "$RUNNER_TEMP/pr.diff"
+          fi
+          cargo mutants --package "datastream-${PACKAGE}" --no-shuffle "$@"

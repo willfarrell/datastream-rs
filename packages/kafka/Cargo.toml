@@ -1,0 +1,25 @@
+[package]
+name = "datastream-kafka"
+description = "Kafka producer and consumer streams"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+rdkafka = ["dep:rdkafka"]
+
+[dependencies]
+datastream-core.workspace = true
+async-stream.workspace = true
+futures.workspace = true
+tokio.workspace = true
+rdkafka = { version = "0.39", optional = true }
+
+[dev-dependencies]
+criterion.workspace = true
+proptest.workspace = true
+
+[[bench]]
+name = "index"
+harness = false

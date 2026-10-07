@@ -1,0 +1,21 @@
+[package]
+name = "datastream-ipfs"
+description = "IPFS get and add streams"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+async-stream.workspace = true
+datastream-core.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+proptest.workspace = true
+
+[[bench]]
+name = "index"
+harness = false
