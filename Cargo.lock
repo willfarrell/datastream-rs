@@ -1990,7 +1990,7 @@ name = "datastream-base64"
 version = "0.1.0"
 dependencies = [
  "async-stream",
- "base64 0.22.1",
+ "base64 0.23.1",
  "criterion",
  "datastream-core",
  "proptest",
