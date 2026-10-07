@@ -50,7 +50,7 @@ datastream-core.workspace = true
 futures.workspace = true
 serde_json.workspace = true
 sha1 = { version = "0.10", optional = true }
-sha2 = { version = "0.10", optional = true }
+sha2 = { version = "0.11", optional = true }
 tokio.workspace = true
 
 [dev-dependencies]
