@@ -56,7 +56,7 @@ fn encode_options(desc: &MessageDescriptor) -> ProtobufEncodeOptions {
 fn decode_options(desc: &MessageDescriptor) -> ProtobufDecodeOptions<Vec<u8>> {
     ProtobufDecodeOptions {
         type_: desc.clone().into(),
-        max_output_size: None,
+        max_message_size: None,
     }
 }
 

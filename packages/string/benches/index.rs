@@ -5,9 +5,9 @@ use std::time::Duration;
 use criterion::{criterion_group, criterion_main, Criterion};
 use datastream_core::{create_readable_stream, pipeline, stream_to_array, stream_to_string};
 use datastream_string::{
-    string_count_stream, string_length_stream, string_minimum_chunk_size,
-    string_minimum_first_chunk_size, string_readable_stream, string_replace_stream,
-    string_skip_consecutive_duplicates, string_split_stream, StringCountOptions,
+    string_count_stream, string_length_stream, string_minimum_chunk_size_stream,
+    string_minimum_first_chunk_size_stream, string_replace_stream,
+    string_skip_consecutive_duplicates_stream, string_split_stream, StringCountOptions,
     StringLengthOptions, StringMinimumChunkSizeOptions, StringReplaceOptions, StringSplitOptions,
 };
 use regex::Regex;
@@ -24,7 +24,7 @@ fn benches(c: &mut Criterion) {
     c.bench_function("stringLengthStream 1MB", |b| {
         b.to_async(&runtime).iter(|| async {
             let (stream, result) = string_length_stream(
-                string_readable_stream(big_string.clone()),
+                create_readable_stream([big_string.clone()]),
                 StringLengthOptions::default(),
             );
             pipeline(stream, &[&result]).await.unwrap()
@@ -35,7 +35,7 @@ fn benches(c: &mut Criterion) {
         c.bench_function(&format!("stringCountStream 1MB, count {substr:?}"), |b| {
             b.to_async(&runtime).iter(|| async {
                 let (stream, result) = string_count_stream(
-                    string_readable_stream(big_string.clone()),
+                    create_readable_stream([big_string.clone()]),
                     StringCountOptions {
                         substr: substr.into(),
                         ..Default::default()
@@ -50,7 +50,7 @@ fn benches(c: &mut Criterion) {
     c.bench_function("stringSplitStream 1MB, split by newline", |b| {
         b.to_async(&runtime).iter(|| async {
             let stream = string_split_stream(
-                string_readable_stream(big_string.clone()),
+                create_readable_stream([big_string.clone()]),
                 StringSplitOptions {
                     separator: "\n".into(),
                     ..Default::default()
@@ -65,13 +65,14 @@ fn benches(c: &mut Criterion) {
     c.bench_function("stringReplaceStream 1MB, replace char", |b| {
         b.to_async(&runtime).iter(|| async {
             let stream = string_replace_stream(
-                string_readable_stream(big_string.clone()),
+                create_readable_stream([big_string.clone()]),
                 StringReplaceOptions {
                     pattern: pattern.clone().into(),
                     replacement: "X".into(),
                     ..Default::default()
                 },
-            );
+            )
+            .unwrap();
             stream_to_string(stream, None).await.unwrap()
         })
     });
@@ -81,8 +82,8 @@ fn benches(c: &mut Criterion) {
     };
     c.bench_function("stringMinimumFirstChunkSizeStream 1MB, 64KB", |b| {
         b.to_async(&runtime).iter(|| async {
-            let stream = string_minimum_first_chunk_size(
-                string_readable_stream(big_string.clone()),
+            let stream = string_minimum_first_chunk_size_stream(
+                create_readable_stream([big_string.clone()]),
                 min.clone(),
             );
             stream_to_string(stream, None).await.unwrap()
@@ -90,8 +91,10 @@ fn benches(c: &mut Criterion) {
     });
     c.bench_function("stringMinimumChunkSizeStream 1MB, 64KB", |b| {
         b.to_async(&runtime).iter(|| async {
-            let stream =
-                string_minimum_chunk_size(string_readable_stream(big_string.clone()), min.clone());
+            let stream = string_minimum_chunk_size_stream(
+                create_readable_stream([big_string.clone()]),
+                min.clone(),
+            );
             stream_to_string(stream, None).await.unwrap()
         })
     });
@@ -105,8 +108,9 @@ fn benches(c: &mut Criterion) {
             &format!("stringSkipConsecutiveDuplicatesStream 10K, {name}"),
             |b| {
                 b.to_async(&runtime).iter(|| async {
-                    let stream =
-                        string_skip_consecutive_duplicates(create_readable_stream(chunks.clone()));
+                    let stream = string_skip_consecutive_duplicates_stream(create_readable_stream(
+                        chunks.clone(),
+                    ));
                     stream_to_array(stream, None).await.unwrap()
                 })
             },

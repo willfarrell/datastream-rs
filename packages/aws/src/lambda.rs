@@ -27,7 +27,8 @@ pub fn aws_lambda_readable_stream(
                         }
                     }
                     Event::InvokeComplete(complete) => {
-                        if let Some(code) = complete.error_code {
+                        // An empty ErrorCode is a success, as an absent one is.
+                        if let Some(code) = complete.error_code.filter(|code| !code.is_empty()) {
                             let cause = format!(
                                 "FunctionName: {function_name:?}, index: {index}, ErrorDetails: {:?}",
                                 complete.error_details
@@ -135,6 +136,19 @@ mod tests {
             r#"FunctionName: Some("fn1"), index: 0, ErrorDetails: Some("ErrorDetails")"#
         );
         assert_eq!(fn2.num_calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn treats_invoke_complete_without_error_code_as_success() {
+        let rule = mock!(Client::invoke_with_response_stream).then_http_response(|| {
+            response(&[
+                ("PayloadChunk", "1"),
+                ("InvokeComplete", r#"{"ErrorCode":""}"#),
+                ("PayloadChunk", "2"),
+            ])
+        });
+        let client = mock_client!(aws_sdk_lambda, RuleMode::MatchAny, [&rule]);
+        assert_eq!(invoke(&client, &["fn"]).await.unwrap(), "12");
     }
 
     #[tokio::test]

@@ -6,13 +6,15 @@
 //! Every stream takes and yields byte chunks. Output is size-guarded:
 //! compression only when `max_output_size` is set, decompression always
 //! (default 256MiB, zip-bomb protection). Pass `Some(usize::MAX)` to opt out.
+//! Decompression fails input that ends mid-stream ("unexpected end of file")
+//! instead of yielding the partial output.
 
 use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
 
 use async_stream::try_stream;
 use datastream_core::{DataStream, Error, StreamExt};
-use flate2::Compression;
+use flate2::{Compression, Decompress, FlushDecompress, Status};
 
 /// Default decompression output ceiling (256MiB).
 pub const DEFAULT_DECOMPRESS_MAX_OUTPUT_SIZE: usize = 256 * 1024 * 1024;
@@ -21,6 +23,8 @@ pub const DEFAULT_DECOMPRESS_MAX_OUTPUT_SIZE: usize = 256 * 1024 * 1024;
 pub struct CompressOptions {
     /// gzip/deflate: -1 to 9, brotli: 0 to 11 (default 11), zstd: level (default 3).
     pub quality: Option<i32>,
+    /// gzip/deflate only: zlib level (-1 to 9); takes precedence over `quality`.
+    pub level: Option<i32>,
     /// Unbounded when `None`.
     pub max_output_size: Option<usize>,
 }
@@ -151,7 +155,7 @@ pub fn gzip_compress_stream(
     input: DataStream<Vec<u8>>,
     options: CompressOptions,
 ) -> DataStream<Vec<u8>> {
-    let level = zlib_level(options.quality);
+    let level = zlib_level(options.level.or(options.quality));
     code(
         input,
         compress_limit(&options),
@@ -174,13 +178,91 @@ pub fn gzip_decompress_stream(
     )
 }
 
+// node's message for a stream that ends before the codec has finished.
+fn unexpected_eof() -> io::Error {
+    io::Error::new(io::ErrorKind::UnexpectedEof, "unexpected end of file")
+}
+
 // *** deflate (zlib format, like node's createDeflate) *** //
+
+const INFLATE_BUFFER_SIZE: usize = 32 * 1024;
+
+/// zlib inflater over [`Decompress`]. Unlike `flate2::write::ZlibDecoder` it
+/// fails a stream that ends before its final block, as node's createInflate
+/// does, instead of silently yielding the truncated output.
+struct Inflate {
+    inner: Decompress,
+    sink: Sink,
+    buf: Vec<u8>,
+    ended: bool,
+}
+
+impl Inflate {
+    fn new(sink: Sink) -> Self {
+        Self {
+            inner: Decompress::new(true),
+            sink,
+            buf: Vec::with_capacity(INFLATE_BUFFER_SIZE),
+            ended: false,
+        }
+    }
+
+    /// Inflate what fits of `data` into one buffer and hand it to the sink.
+    /// Returns (bytes consumed, whether anything moved).
+    fn run(&mut self, data: &[u8], flush: FlushDecompress) -> io::Result<(usize, bool)> {
+        let (before_in, before_out) = (self.inner.total_in(), self.inner.total_out());
+        self.buf.clear();
+        let status = self.inner.decompress_vec(data, &mut self.buf, flush)?;
+        self.ended = status == Status::StreamEnd;
+        self.sink.write_all(&self.buf)?;
+        let used = (self.inner.total_in() - before_in) as usize;
+        Ok((used, used > 0 || self.inner.total_out() > before_out))
+    }
+
+    fn finish(mut self) -> io::Result<()> {
+        while !self.ended {
+            let (_, moved) = self.run(&[], FlushDecompress::Finish)?;
+            if !moved && !self.ended {
+                return Err(unexpected_eof());
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Write for Inflate {
+    fn write(&mut self, mut data: &[u8]) -> io::Result<usize> {
+        let len = data.len();
+        while !data.is_empty() {
+            if self.ended {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "trailing bytes after end of deflate stream",
+                ));
+            }
+            let (used, moved) = self.run(data, FlushDecompress::None)?;
+            // An empty output buffer and pending input always move something;
+            // guard against spinning if the codec ever disagrees.
+            if !moved && !self.ended {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "corrupt deflate stream",
+                ));
+            }
+            data = &data[used..];
+        }
+        Ok(len)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
 
 pub fn deflate_compress_stream(
     input: DataStream<Vec<u8>>,
     options: CompressOptions,
 ) -> DataStream<Vec<u8>> {
-    let level = zlib_level(options.quality);
+    let level = zlib_level(options.level.or(options.quality));
     code(
         input,
         compress_limit(&options),
@@ -198,8 +280,8 @@ pub fn deflate_decompress_stream(
         input,
         decompress_limit(&options),
         "Decompression",
-        |sink| Ok(flate2::write::ZlibDecoder::new(sink)),
-        |c: flate2::write::ZlibDecoder<Sink>| c.finish().map(drop),
+        |sink| Ok(Inflate::new(sink)),
+        Inflate::finish,
     )
 }
 
@@ -246,7 +328,9 @@ pub fn brotli_decompress_stream(
         decompress_limit(&options),
         "Decompression",
         |sink| Ok(brotli::DecompressorWriter::new(sink, BROTLI_BUFFER_SIZE)),
-        |mut c: brotli::DecompressorWriter<Sink>| c.close(),
+        // Bad data fails the write; close() only fails a stream that is not
+        // finished (truncated, or no input at all).
+        |mut c: brotli::DecompressorWriter<Sink>| c.close().map_err(|_| unexpected_eof()),
     )
 }
 
@@ -268,6 +352,44 @@ pub fn zstd_compress_stream(
     )
 }
 
+/// zstd decoder that, unlike `zstd::stream::write::Decoder`, fails a frame
+/// cut short instead of silently yielding the truncated output. Empty input
+/// (zero frames) is still empty output.
+struct Unzstd {
+    inner: zstd::stream::zio::Writer<Sink, zstd::stream::raw::Decoder<'static>>,
+    written: bool,
+}
+
+impl Unzstd {
+    fn new(sink: Sink) -> io::Result<Self> {
+        let decoder = zstd::stream::raw::Decoder::new()?;
+        Ok(Self {
+            inner: zstd::stream::zio::Writer::new(sink, decoder),
+            written: false,
+        })
+    }
+
+    fn finish(mut self) -> io::Result<()> {
+        if !self.written {
+            return Ok(());
+        }
+        self.inner.finish().map_err(|e| match e.kind() {
+            io::ErrorKind::UnexpectedEof => unexpected_eof(),
+            _ => e,
+        })
+    }
+}
+
+impl Write for Unzstd {
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        self.written |= !data.is_empty();
+        self.inner.write(data)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 pub fn zstd_decompress_stream(
     input: DataStream<Vec<u8>>,
     options: DecompressOptions,
@@ -276,8 +398,8 @@ pub fn zstd_decompress_stream(
         input,
         decompress_limit(&options),
         "Decompression",
-        zstd::stream::write::Decoder::new,
-        |mut c: zstd::stream::write::Decoder<'static, Sink>| c.flush(),
+        Unzstd::new,
+        Unzstd::finish,
     )
 }
 
@@ -440,6 +562,44 @@ mod tests {
         }
     }
 
+    // gzip and deflate accept `level` (level ?? quality); exact output vs the
+    // sync encoder pins both the precedence and the routing to zlib.
+    #[tokio::test]
+    async fn level_overrides_quality() {
+        let cases: [(&str, Compressor); 2] = [
+            ("gzip", gzip_compress_stream),
+            ("deflate", deflate_compress_stream),
+        ];
+        for (name, compress) in cases {
+            for (level, quality) in [(Some(9), Some(1)), (Some(1), None)] {
+                let options = CompressOptions {
+                    level,
+                    quality,
+                    ..Default::default()
+                };
+                let output = run(compress(chunks(body()), options)).await.unwrap();
+                let expected = CompressOptions {
+                    quality: level,
+                    ..Default::default()
+                };
+                let expected = run(compress(chunks(body()), expected)).await.unwrap();
+                assert_eq!(output, expected, "{name} {level:?} {quality:?}");
+            }
+        }
+        // And it really is the zlib level.
+        let options = CompressOptions {
+            level: Some(1),
+            quality: Some(9),
+            ..Default::default()
+        };
+        let output = run(gzip_compress_stream(chunks(body()), options))
+            .await
+            .unwrap();
+        let mut e = flate2::write::GzEncoder::new(Vec::new(), Compression::new(1));
+        e.write_all(&body()).unwrap();
+        assert_eq!(output, e.finish().unwrap());
+    }
+
     #[tokio::test]
     async fn deflate_matches_sync_level() {
         for level in [1, 9] {
@@ -579,6 +739,77 @@ mod tests {
             );
             assert!(run(stream).await.unwrap().is_empty(), "{name}");
         }
+    }
+
+    // node fails a stream that ends early rather than yielding the partial output.
+    #[tokio::test]
+    async fn truncated_input_errors_at_every_cut() {
+        for (name, _, decompress) in ALL {
+            let input = compress_sync(name, &body());
+            for len in 1..input.len() {
+                let e = run(decompress(
+                    chunks(input[..len].to_vec()),
+                    Default::default(),
+                ))
+                .await;
+                assert!(e.is_err(), "{name} cut at {len}");
+            }
+            // The last block missing: node's message.
+            if name != "gzip" {
+                let e = run(decompress(
+                    chunks(input[..input.len() - 1].to_vec()),
+                    Default::default(),
+                ))
+                .await
+                .unwrap_err();
+                assert_eq!(e.to_string(), "unexpected end of file", "{name}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_input_errors_except_zstd() {
+        for (name, _, decompress) in ALL {
+            let empty = create_readable_stream(Vec::<Vec<u8>>::new());
+            let output = run(decompress(empty, Default::default())).await;
+            if name == "zstd" {
+                // Zero frames is a valid (empty) zstd stream.
+                assert!(output.unwrap().is_empty());
+            } else {
+                assert!(output.is_err(), "{name}");
+            }
+        }
+        let empty = create_readable_stream(Vec::<Vec<u8>>::new());
+        let e = run(brotli_decompress_stream(empty, Default::default()))
+            .await
+            .unwrap_err();
+        assert_eq!(e.to_string(), "unexpected end of file");
+    }
+
+    #[tokio::test]
+    async fn trailing_bytes_error() {
+        for (name, _, decompress) in ALL {
+            let mut input = compress_sync(name, &body());
+            input.extend_from_slice(&[1, 2, 3]);
+            let output = run(decompress(chunks(input), Default::default())).await;
+            assert!(output.is_err(), "{name}");
+        }
+        let mut input = compress_sync("deflate", &body());
+        input.push(0);
+        let e = run(deflate_decompress_stream(chunks(input), Default::default()))
+            .await
+            .unwrap_err();
+        assert_eq!(e.to_string(), "trailing bytes after end of deflate stream");
+    }
+
+    #[tokio::test]
+    async fn concatenated_zstd_frames_decode() {
+        let mut input = compress_sync("zstd", b"ab");
+        input.extend(compress_sync("zstd", b"cd"));
+        let output = run(zstd_decompress_stream(chunks(input), Default::default()))
+            .await
+            .unwrap();
+        assert_eq!(output, b"abcd");
     }
 
     #[tokio::test]

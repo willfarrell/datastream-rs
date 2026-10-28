@@ -61,7 +61,7 @@ proptest! {
         let (stream, result) =
             object_count_stream(create_readable_stream(input.clone()), ObjectCountOptions::default());
         let output = block_on(pipeline(stream, &[&result])).unwrap();
-        prop_assert_eq!(&output["count"], &json!(input.len()));
+        prop_assert_eq!(&output["objectCount"], &json!(input.len()));
     }
 
     #[test]

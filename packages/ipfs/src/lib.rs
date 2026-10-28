@@ -247,6 +247,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn add_stream_releases_chunks_when_add_resolves_without_pulling() {
+        let node = node(|source| {
+            Box::pin(async move {
+                let _source = source;
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                Ok("QmUnpulled".to_string())
+            })
+        });
+        let (stream, result) =
+            ipfs_add_stream(input(&["a", "b"]), &node, IpfsAddOptions::default());
+        let out = tokio::time::timeout(Duration::from_secs(1), pipeline(stream, &[&result]))
+            .await
+            .expect("pipeline hung")
+            .unwrap();
+        assert_eq!(out["cid"], "QmUnpulled");
+    }
+
+    #[tokio::test]
+    async fn add_stream_ends_a_source_waiting_when_input_ends() {
+        let node = node(|mut source| {
+            Box::pin(async move {
+                let mut chunks = Vec::new();
+                while let Some(chunk) = source.next().await {
+                    chunks.push(String::from_utf8(chunk?).unwrap());
+                }
+                Ok(chunks.join(","))
+            })
+        });
+        let (tx, rx) = channel_input();
+        let (stream, result) = ipfs_add_stream(rx, &node, IpfsAddOptions::default());
+        let run = tokio::spawn(async move {
+            let _ = stream_to_array(stream, None).await.unwrap();
+        });
+        tx.send(Ok(b"a".to_vec())).await.unwrap();
+        // Let node.add pull "a" and wait on the next chunk.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        drop(tx);
+        tokio::time::timeout(Duration::from_secs(1), run)
+            .await
+            .expect("pipeline hung")
+            .unwrap();
+        assert_eq!(result.get(), "a");
+    }
+
+    fn channel_input() -> (mpsc::Sender<Result<Vec<u8>>>, DataStream<Vec<u8>>) {
+        let (tx, mut rx) = mpsc::channel(1);
+        let stream = Box::pin(async_stream::stream! {
+            while let Some(item) = rx.recv().await {
+                yield item;
+            }
+        });
+        (tx, stream)
+    }
+
+    #[tokio::test]
     async fn add_stream_applies_backpressure() {
         let accepted = Arc::new(AtomicUsize::new(0));
         let consumed = Arc::new(AtomicUsize::new(0));

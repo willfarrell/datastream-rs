@@ -77,7 +77,8 @@ impl AwsPollingOptions {
 /// Options for the batching writables (SQS, SNS, Kinesis).
 #[derive(Default, Clone, Debug)]
 pub struct AwsWriteOptions {
-    /// Retries for partially failed batches (default 10).
+    /// Retries for partially failed batches (default 10; `u32::MAX` retries
+    /// without limit).
     pub retry_max_count: Option<u32>,
     pub signal: Option<CancellationToken>,
 }
@@ -109,6 +110,11 @@ pub(crate) async fn backoff(retry_count: u32, signal: Option<&CancellationToken>
     timeout(Duration::from_millis(ms), signal).await
 }
 
+/// A `retry_max_count` of `u32::MAX` retries without limit (JS `null`).
+pub(crate) fn retries_exhausted(retry_count: u32, max_count: u32) -> bool {
+    max_count != u32::MAX && retry_count >= max_count
+}
+
 /// SDK list fields are `Vec<T>` or `Option<Vec<T>>` depending on the model.
 pub(crate) trait IntoVec<T> {
     fn into_vec(self) -> Vec<T>;
@@ -126,6 +132,51 @@ impl<T> IntoVec<T> for Option<Vec<T>> {
     }
 }
 
+/// A writer stopped (input error, abort, oversize entry, ...) with entries
+/// still buffered below a batch limit. They were never sent, so they are handed
+/// back for the caller to recover or retry (the `KafkaProduceError` contract).
+/// A failed request is never reported here: its batch was already handed off.
+#[derive(Debug)]
+pub struct AwsUnsentError<E> {
+    pub error: Error,
+    pub failed_messages: Vec<E>,
+}
+
+impl<E> std::fmt::Display for AwsUnsentError<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(f)
+    }
+}
+
+impl<E: std::fmt::Debug> std::error::Error for AwsUnsentError<E> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&*self.error)
+    }
+}
+
+/// Attach the still-buffered entries (if any) to `error`.
+pub(crate) fn unsent<E>(error: Error, buffered: Vec<E>) -> Error
+where
+    E: std::fmt::Debug + Send + Sync + 'static,
+{
+    if buffered.is_empty() {
+        return error;
+    }
+    Box::new(AwsUnsentError {
+        error,
+        failed_messages: buffered,
+    })
+}
+
+/// The next input entry (`None` at the end), failing with "Aborted" as soon as
+/// `signal` is cancelled so a writer stops without waiting on its input.
+pub(crate) async fn next_entry<E>(
+    input: &mut DataStream<E>,
+    signal: Option<&CancellationToken>,
+) -> Result<Option<E>> {
+    send(async { input.next().await.transpose() }, signal).await
+}
+
 /// Batch limits and sizing for [`batch_write`].
 pub(crate) struct Batcher<E> {
     pub max_entries: usize,
@@ -139,10 +190,39 @@ pub(crate) struct Retry {
     pub max_count: u32,
     pub signal: Option<CancellationToken>,
     pub message: &'static str,
+    /// Turns the failure descriptions into the error's cause.
+    pub describe: fn(Vec<String>) -> String,
+}
+
+/// Describe failures as a list, e.g. `[Entry { .. }, Entry { .. }]`.
+pub(crate) fn describe_list(failures: Vec<String>) -> String {
+    format!("[{}]", failures.join(", "))
+}
+
+/// What one batch request left undone.
+pub(crate) struct Sent<E> {
+    /// Entries to send again.
+    pub retry: Vec<E>,
+    /// Describes the failures behind `retry`.
+    pub failed: Vec<String>,
+    /// Failures retrying cannot fix (SNS/SQS `SenderFault`): set aside rather
+    /// than retried, and reported with the rest once the batch settles.
+    pub permanent: Vec<String>,
+}
+
+impl<E> Sent<E> {
+    pub fn ok() -> Self {
+        Sent {
+            retry: Vec::new(),
+            failed: Vec::new(),
+            permanent: Vec::new(),
+        }
+    }
 }
 
 /// Write `input` in batches within `batcher`'s limits. `send` gets each batch
-/// and returns the entries to retry plus a description of the failures.
+/// and returns what is left to retry. An input error, abort or oversize entry
+/// hands the still-buffered entries back as [`AwsUnsentError`].
 pub(crate) async fn batch_write<E, F, Fut>(
     mut input: DataStream<E>,
     batcher: Batcher<E>,
@@ -150,16 +230,19 @@ pub(crate) async fn batch_write<E, F, Fut>(
     mut send: F,
 ) -> Result<()>
 where
+    E: std::fmt::Debug + Send + Sync + 'static,
     F: FnMut(Vec<E>) -> Fut,
-    Fut: Future<Output = Result<(Vec<E>, String)>>,
+    Fut: Future<Output = Result<Sent<E>>>,
 {
     let mut batch = Vec::new();
     let mut batch_bytes = 0;
-    while let Some(entry) = input.next().await {
-        let entry = entry?;
+    while let Some(entry) = next_entry(&mut input, retry.signal.as_ref())
+        .await
+        .map_err(|error| unsent(error, std::mem::take(&mut batch)))?
+    {
         let bytes = (batcher.size)(&entry);
         if bytes > batcher.max_entry_bytes {
-            return Err((batcher.oversize)(&entry, bytes));
+            return Err(unsent((batcher.oversize)(&entry, bytes), batch));
         }
         if batch.len() == batcher.max_entries
             || (!batch.is_empty() && batch_bytes + bytes > batcher.max_batch_bytes)
@@ -179,20 +262,24 @@ where
 async fn retry_send<E, F, Fut>(mut entries: Vec<E>, retry: &Retry, send: &mut F) -> Result<()>
 where
     F: FnMut(Vec<E>) -> Fut,
-    Fut: Future<Output = Result<(Vec<E>, String)>>,
+    Fut: Future<Output = Result<Sent<E>>>,
 {
     let mut retry_count = 0;
+    let mut permanent = Vec::new();
     loop {
-        let (failed, cause) = send(entries).await?;
-        if failed.is_empty() {
-            return Ok(());
-        }
-        if retry_count >= retry.max_count {
-            return Err(cause_error(retry.message, cause));
+        let sent = send(entries).await?;
+        permanent.extend(sent.permanent);
+        if sent.retry.is_empty() || retries_exhausted(retry_count, retry.max_count) {
+            let mut failed = permanent;
+            failed.extend(sent.failed);
+            if failed.is_empty() {
+                return Ok(());
+            }
+            return Err(cause_error(retry.message, (retry.describe)(failed)));
         }
         backoff(retry_count, retry.signal.as_ref()).await?;
-        retry_count += 1;
-        entries = failed;
+        retry_count = retry_count.saturating_add(1);
+        entries = sent.retry;
     }
 }
 
@@ -259,6 +346,22 @@ mod tests {
             max_count,
             signal: None,
             message: "failed",
+            describe: describe_list,
+        }
+    }
+
+    // Entry `n` fails (retryably) while `n` is in `retryable`, permanently when
+    // in `permanent`.
+    fn sent(batch: Vec<usize>, retryable: &[usize], permanent: &[usize]) -> Sent<usize> {
+        let describe = |n: &usize| format!("entry {n}");
+        let retry: Vec<usize> = batch
+            .into_iter()
+            .filter(|n| retryable.contains(n))
+            .collect();
+        Sent {
+            failed: retry.iter().map(describe).collect(),
+            retry,
+            permanent: permanent.iter().map(describe).collect(),
         }
     }
 
@@ -269,7 +372,7 @@ mod tests {
         let input = create_readable_stream([1, 1, 1, 1, 5, 5, 4]);
         batch_write(input, batcher(), retry(0), move |batch| {
             seen.lock().unwrap().push(batch);
-            async { Ok((Vec::new(), String::new())) }
+            async { Ok(Sent::ok()) }
         })
         .await
         .unwrap();
@@ -283,12 +386,93 @@ mod tests {
     #[tokio::test]
     async fn batch_write_rejects_oversize_entry() {
         let input = create_readable_stream([11]);
-        let e = batch_write(input, batcher(), retry(0), |_| async {
-            Ok((Vec::new(), String::new()))
+        let e = batch_write(input, batcher(), retry(0), |_| async { Ok(Sent::ok()) })
+            .await
+            .unwrap_err();
+        assert_eq!(e.to_string(), "too big 11");
+        assert!(e.downcast_ref::<AwsUnsentError<usize>>().is_none());
+    }
+
+    #[tokio::test]
+    async fn batch_write_attaches_buffered_entries_to_oversize_error() {
+        let calls = Arc::new(Mutex::new(0));
+        let seen = calls.clone();
+        let input = create_readable_stream([1, 2, 11]);
+        let e = batch_write(input, batcher(), retry(0), move |_| {
+            *seen.lock().unwrap() += 1;
+            async { Ok(Sent::ok()) }
         })
         .await
         .unwrap_err();
         assert_eq!(e.to_string(), "too big 11");
+        let unsent = e.downcast_ref::<AwsUnsentError<usize>>().unwrap();
+        assert_eq!(unsent.failed_messages, [1, 2]);
+        assert_eq!(*calls.lock().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn batch_write_attaches_buffered_entries_to_input_error() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let seen = calls.clone();
+        // One full batch is sent; the two entries after it are not.
+        let input: Vec<Result<usize>> = vec![Ok(1), Ok(1), Ok(1), Ok(2), Ok(3), Err("boom".into())];
+        let input: DataStream<usize> = Box::pin(futures::stream::iter(input));
+        let e = batch_write(input, batcher(), retry(0), move |batch| {
+            seen.lock().unwrap().push(batch);
+            async { Ok(Sent::ok()) }
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(e.to_string(), "boom");
+        let unsent = e.downcast_ref::<AwsUnsentError<usize>>().unwrap();
+        assert_eq!(unsent.failed_messages, [2, 3]);
+        assert_eq!(*calls.lock().unwrap(), [vec![1, 1, 1]]);
+
+        // Nothing buffered: the input error comes through as is.
+        let input: DataStream<usize> = Box::pin(futures::stream::iter(vec![Err("boom".into())]));
+        let e = batch_write(input, batcher(), retry(0), |_| async { Ok(Sent::ok()) })
+            .await
+            .unwrap_err();
+        assert_eq!(e.to_string(), "boom");
+        assert!(e.downcast_ref::<AwsUnsentError<usize>>().is_none());
+    }
+
+    #[tokio::test]
+    async fn batch_write_abort_attaches_buffered_entries_without_sending() {
+        let signal = CancellationToken::new();
+        let (sender, input) = datastream_core::create_readable_channel::<usize>(Some(4));
+        let calls = Arc::new(Mutex::new(0));
+        let seen = calls.clone();
+        let retry = Retry {
+            signal: Some(signal.clone()),
+            ..retry(0)
+        };
+        let task = tokio::spawn(batch_write(input, batcher(), retry, move |_| {
+            *seen.lock().unwrap() += 1;
+            async { Ok(Sent::ok()) }
+        }));
+        sender.send(1).await.unwrap();
+        sender.send(2).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        signal.cancel();
+        let e = task.await.unwrap().unwrap_err();
+        assert_eq!(e.to_string(), "Aborted");
+        let unsent = e.downcast_ref::<AwsUnsentError<usize>>().unwrap();
+        assert_eq!(unsent.failed_messages, [1, 2]);
+        assert_eq!(*calls.lock().unwrap(), 0);
+        drop(sender);
+    }
+
+    #[tokio::test]
+    async fn batch_write_does_not_report_a_failed_request_as_unsent() {
+        let input = create_readable_stream([1, 1, 1, 1]);
+        let e = batch_write(input, batcher(), retry(0), |_| async {
+            Err::<Sent<usize>, Error>("send failed".into())
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(e.to_string(), "send failed");
+        assert!(e.downcast_ref::<AwsUnsentError<usize>>().is_none());
     }
 
     #[tokio::test(start_paused = true)]
@@ -298,28 +482,108 @@ mod tests {
         let input = create_readable_stream([1, 2]);
         let e = batch_write(input, batcher(), retry(2), move |batch: Vec<usize>| {
             seen.lock().unwrap().push(batch.clone());
-            let failed = batch.into_iter().filter(|n| *n == 2).collect();
-            async move { Ok((failed, "entry 2".to_string())) }
+            async move { Ok(sent(batch, &[2], &[])) }
         })
         .await
         .unwrap_err();
         assert_eq!(e.to_string(), "failed");
-        assert_eq!(e.downcast_ref::<CauseError>().unwrap().cause, "entry 2");
+        assert_eq!(e.downcast_ref::<CauseError>().unwrap().cause, "[entry 2]");
         assert_eq!(*calls.lock().unwrap(), [vec![1, 2], vec![2], vec![2]]);
+    }
+
+    // 11 failures: one more than the default retry_max_count of 10.
+    #[tokio::test(start_paused = true)]
+    async fn batch_write_retries_without_limit_at_u32_max() {
+        let calls = Arc::new(Mutex::new(0));
+        let seen = calls.clone();
+        let input = create_readable_stream([1]);
+        batch_write(
+            input,
+            batcher(),
+            retry(u32::MAX),
+            move |batch: Vec<usize>| {
+                let mut calls = seen.lock().unwrap();
+                *calls += 1;
+                let sent = if *calls <= 11 {
+                    sent(batch, &[1], &[])
+                } else {
+                    Sent::ok()
+                };
+                async move { Ok(sent) }
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(*calls.lock().unwrap(), 12);
+        assert!(!retries_exhausted(u32::MAX, u32::MAX));
+        assert!(retries_exhausted(10, 10));
+    }
+
+    // Permanent failures are set aside while the retryable rest backs off, then
+    // reported together.
+    #[tokio::test(start_paused = true)]
+    async fn batch_write_retries_retryable_alongside_permanent_failures() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let seen = calls.clone();
+        let input = create_readable_stream([1, 2, 3]);
+        let e = batch_write(input, batcher(), retry(1), move |batch: Vec<usize>| {
+            let first = seen.lock().unwrap().is_empty();
+            seen.lock().unwrap().push(batch.clone());
+            let permanent: &[usize] = if first { &[2] } else { &[] };
+            async move { Ok(sent(batch, &[1], permanent)) }
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(
+            e.downcast_ref::<CauseError>().unwrap().cause,
+            "[entry 2, entry 1]"
+        );
+        assert_eq!(*calls.lock().unwrap(), [vec![1, 2, 3], vec![1]]);
+
+        // Retryable entries that then succeed leave only the permanent ones.
+        let calls = Arc::new(Mutex::new(0));
+        let seen = calls.clone();
+        let input = create_readable_stream([1, 2]);
+        let e = batch_write(input, batcher(), retry(5), move |batch: Vec<usize>| {
+            let mut calls = seen.lock().unwrap();
+            *calls += 1;
+            let sent = if *calls == 1 {
+                sent(batch, &[1], &[2])
+            } else {
+                Sent::ok()
+            };
+            async move { Ok(sent) }
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(e.downcast_ref::<CauseError>().unwrap().cause, "[entry 2]");
+        assert_eq!(*calls.lock().unwrap(), 2);
+
+        // Only permanent failures: no retry at all.
+        let calls = Arc::new(Mutex::new(0));
+        let seen = calls.clone();
+        let input = create_readable_stream([1]);
+        batch_write(input, batcher(), retry(5), move |batch: Vec<usize>| {
+            *seen.lock().unwrap() += 1;
+            async move { Ok(sent(batch, &[], &[1])) }
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(*calls.lock().unwrap(), 1);
     }
 
     #[tokio::test]
     async fn batch_write_aborts_retry_backoff() {
         let signal = CancellationToken::new();
-        signal.cancel();
         let retry = Retry {
-            max_count: 5,
-            signal: Some(signal),
-            message: "failed",
+            signal: Some(signal.clone()),
+            ..retry(5)
         };
         let input = create_readable_stream([1]);
-        let e = batch_write(input, batcher(), retry, |batch| async move {
-            Ok((batch, String::new()))
+        let e = batch_write(input, batcher(), retry, move |batch| {
+            // Cancelled once the batch is in flight, so the backoff is what aborts.
+            signal.cancel();
+            async move { Ok(sent(batch, &[1], &[])) }
         })
         .await
         .unwrap_err();

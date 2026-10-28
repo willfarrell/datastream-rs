@@ -3,8 +3,10 @@
 //! File read and write streams, ported from `@datastream/file`.
 //!
 //! With `base_path` set, the path must resolve inside it, must not be a
-//! symbolic link, and is opened with `O_NOFOLLOW` (unix) so a symlink swapped
-//! in after the check is still refused. `types` restricts the extension.
+//! symbolic link, its real (symlink-resolved) parent directory must be inside
+//! the real `base_path`, and it is opened with `O_NOFOLLOW` (unix) so a symlink
+//! swapped in after the check is still refused. `types` restricts the
+//! extension (case-insensitive; `""` accepts an extensionless name).
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -72,30 +74,49 @@ fn resolve(path: &Path) -> io::Result<PathBuf> {
 /// The resolved path, once it is known to be inside `base_path` and not a symlink.
 fn enforce_path(path: &Path, base_path: &Path) -> Result<PathBuf> {
     let resolved = resolve(path)?;
-    match resolved.strip_prefix(resolve(base_path)?) {
+    let resolved_base = resolve(base_path)?;
+    match resolved.strip_prefix(&resolved_base) {
         Ok(rel) if !rel.as_os_str().is_empty() => {}
         _ => return Err("Path traversal detected".into()),
     }
     match std::fs::symlink_metadata(&resolved) {
-        Ok(stat) if stat.file_type().is_symlink() => Err("Symbolic links are not allowed".into()),
-        Ok(_) => Ok(resolved),
+        Ok(stat) if stat.file_type().is_symlink() => {
+            return Err("Symbolic links are not allowed".into())
+        }
+        Ok(_) => {}
         // File may not exist yet (for writes), that's ok
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(resolved),
-        Err(e) => Err(PathNotFound(e).into()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(PathNotFound(e).into()),
     }
+    // The checks above are lexical and only look at the final component, so a
+    // symlinked directory (base_path/link -> /elsewhere) would still escape.
+    // Compare the real parent directory against the real base_path.
+    // Limit: a local attacker swapping a parent directory between this check
+    // and the open (TOCTOU) is out of scope; O_NOFOLLOW only guards the leaf.
+    let real = |p: &Path| std::fs::canonicalize(p).map_err(PathNotFound);
+    // `resolved` is strictly inside `resolved_base`, so it has a parent.
+    let parent = resolved.parent().unwrap_or(&resolved_base);
+    if !real(parent)?.starts_with(real(&resolved_base)?) {
+        return Err("Path traversal detected".into());
+    }
+    Ok(resolved)
 }
 
+// Case-insensitive: "REPORT.CSV" is still a .csv file. Like node's
+// `path.extname`, an extensionless name or a dotfile (".csv") has the
+// extension "", which `types` can list to accept it.
 fn enforce_type(path: &Path, types: &[FileType]) -> Result<()> {
     if types.is_empty() {
         return Ok(());
     }
     let ext = path
         .extension()
-        .map(|e| format!(".{}", e.to_string_lossy()));
+        .map(|e| format!(".{}", e.to_string_lossy().to_lowercase()))
+        .unwrap_or_default();
     let accepted = types
         .iter()
         .flat_map(|t| t.accept.values().flatten())
-        .any(|e| Some(e) == ext.as_ref());
+        .any(|e| e.to_lowercase() == ext);
     if accepted {
         Ok(())
     } else {
@@ -318,6 +339,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn extensionless_path_accepted_when_types_allow_empty() {
+        let (dir, _) = setup("types-empty");
+        for name in ["noext", ".csv"] {
+            let out = dir.join(name);
+            let o = FileOptions {
+                types: types("text/plain", ""),
+                ..options(&out, None)
+            };
+            write(o, "x").await.unwrap();
+            assert_eq!(fs::read_to_string(&out).unwrap(), "x");
+        }
+        // "" does not accept a name that has an extension.
+        let o = FileOptions {
+            types: types("text/plain", ""),
+            ..options(&dir.join("test.csv"), None)
+        };
+        assert_eq!(read_err(o), "Invalid extension");
+    }
+
+    #[tokio::test]
+    async fn extension_check_is_case_insensitive() {
+        let (dir, _) = setup("types-case");
+        let upper = dir.join("UPPER.CSV");
+        fs::write(&upper, CONTENT).unwrap();
+        let o = FileOptions {
+            types: types("text/csv", ".csv"),
+            ..options(&upper, None)
+        };
+        assert_eq!(read(o).await, CONTENT);
+        let out = dir.join("out.json");
+        let o = FileOptions {
+            types: types("application/json", ".JSON"),
+            ..options(&out, None)
+        };
+        write(o, "{}").await.unwrap();
+        assert_eq!(fs::read_to_string(&out).unwrap(), "{}");
+        let o = FileOptions {
+            types: types("application/json", ".json"),
+            ..options(&upper, None)
+        };
+        assert_eq!(read_err(o), "Invalid extension");
+    }
+
+    #[tokio::test]
     async fn write_enforces_extension() {
         let (dir, _) = setup("write-types");
         let out = dir.join("out.csv");
@@ -330,6 +395,66 @@ mod tests {
             "Invalid extension"
         );
         assert!(!out.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rejects_paths_through_symlinked_directories() {
+        let (dir, _) = setup("dirlink");
+        let outside = std::env::temp_dir().join(format!(
+            "datastream-file-test-{}-dirlink-outside",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&outside);
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("secret.csv"), "secret").unwrap();
+        std::os::unix::fs::symlink(&outside, dir.join("dirlink")).unwrap();
+        let msg = "Path traversal detected";
+        assert_eq!(
+            read_err(options(&dir.join("dirlink/secret.csv"), Some(&dir))),
+            msg
+        );
+        let e = write(options(&dir.join("dirlink/new.csv"), Some(&dir)), "x")
+            .await
+            .unwrap_err();
+        assert_eq!(e.to_string(), msg);
+        assert!(!outside.join("new.csv").exists());
+        // A symlinked directory pointing at the parent of base_path.
+        std::os::unix::fs::symlink(dir.parent().unwrap(), dir.join("uplink")).unwrap();
+        assert_eq!(
+            read_err(options(&dir.join("uplink/x.csv"), Some(&dir))),
+            msg
+        );
+        // A symlinked base_path itself is allowed, but path == base_path is not.
+        let link_base = dir.join("linkbase");
+        std::os::unix::fs::symlink(&dir, &link_base).unwrap();
+        assert_eq!(
+            read(options(&link_base.join("test.csv"), Some(&link_base))).await,
+            CONTENT
+        );
+        assert_eq!(read_err(options(&link_base, Some(&link_base))), msg);
+        fs::remove_dir_all(&outside).unwrap();
+    }
+
+    #[tokio::test]
+    async fn names_starting_with_dots_stay_inside_base_path() {
+        let (dir, _) = setup("dots");
+        fs::create_dir_all(dir.join("..cache")).unwrap();
+        for out in [dir.join("..data.csv"), dir.join("..cache/x.csv")] {
+            write(options(&out, Some(&dir)), "dots").await.unwrap();
+            assert_eq!(read(options(&out, Some(&dir))).await, "dots");
+        }
+    }
+
+    #[tokio::test]
+    async fn write_missing_parent_directory_is_path_not_found() {
+        let (dir, _) = setup("missing-parent");
+        let e = write(options(&dir.join("missing/x.csv"), Some(&dir)), "x")
+            .await
+            .unwrap_err();
+        assert_eq!(e.to_string(), "Path not found");
+        let source = e.source().unwrap().downcast_ref::<io::Error>().unwrap();
+        assert_eq!(source.kind(), io::ErrorKind::NotFound);
     }
 
     #[test]

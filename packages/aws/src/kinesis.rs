@@ -9,7 +9,8 @@ use aws_sdk_kinesis::types::{PutRecordsRequestEntry, Record};
 use datastream_core::{DataStream, Error, Result};
 
 use crate::client::{
-    batch_write, cause_error, send, AwsPollingOptions, AwsWriteOptions, Batcher, IntoVec, Retry,
+    batch_write, cause_error, describe_list, send, AwsPollingOptions, AwsWriteOptions, Batcher,
+    IntoVec, Retry, Sent,
 };
 
 // PutRecords limits: <=500 records, <=5 MiB aggregate, <=1 MiB per record.
@@ -18,8 +19,9 @@ const KINESIS_MAX_RECORD_BYTES: usize = 1024 * 1024;
 // 5 MiB aggregate with headroom for request framing.
 const KINESIS_MAX_BATCH_BYTES: usize = 5 * 1024 * 1024 - 64 * 1024;
 
-/// Read records from the request's shard iterator until no more arrive (or
-/// forever with `polling_active`), stopping when the shard closes.
+/// Read records from the request's shard iterator until no more arrive and the
+/// iterator has caught up with the tip (or forever with `polling_active`),
+/// stopping when the shard closes.
 pub fn aws_kinesis_get_records_stream(
     mut request: GetRecordsFluentBuilder,
     options: AwsPollingOptions,
@@ -37,16 +39,25 @@ pub fn aws_kinesis_get_records_stream(
             };
             request = request.shard_iterator(next);
             if empty {
-                if !options.polling_active {
+                // An empty page is not the end while MillisBehindLatest > 0:
+                // Kinesis can return no records while the iterator is still
+                // behind the tip.
+                let behind = output.millis_behind_latest.is_some_and(|ms| ms > 0);
+                if !options.polling_active && !behind {
                     break;
                 }
+                // Wait before re-reading after an empty page, whether idle
+                // polling or catching up: back-to-back empty GetRecords calls
+                // exceed Kinesis' 5 calls/s/shard limit.
                 options.idle().await?;
             }
         }
     })
 }
 
-/// Put records with PutRecords, retrying the records whose result has an `ErrorCode`.
+/// Put records with PutRecords, retrying the records whose result has an
+/// `ErrorCode`. On an input error or abort, records still buffered come back as
+/// [`AwsUnsentError`](crate::AwsUnsentError) (not sent).
 pub async fn aws_kinesis_put_records_stream(
     input: DataStream<PutRecordsRequestEntry>,
     request: PutRecordsFluentBuilder,
@@ -67,6 +78,7 @@ pub async fn aws_kinesis_put_records_stream(
         max_count: options.retry_max_count.unwrap_or(10),
         signal: options.signal,
         message: "awsKinesisPutRecords has failed records",
+        describe: describe_list,
     };
     batch_write(input, batcher, retry, move |records| {
         let request = request.clone().set_records(Some(records.clone()));
@@ -74,21 +86,26 @@ pub async fn aws_kinesis_put_records_stream(
         async move {
             let output = send(request.send(), signal.as_ref()).await?;
             if output.failed_record_count().unwrap_or(0) == 0 {
-                return Ok((Vec::new(), String::new()));
+                return Ok(Sent::ok());
             }
             // Results line up with the sent records by index.
             let results = output.records();
-            let failed = records
+            let retry = records
                 .into_iter()
                 .zip(results)
                 .filter(|(_, result)| result.error_code().is_some())
                 .map(|(record, _)| record)
                 .collect();
-            let errors: Vec<_> = results
+            let failed = results
                 .iter()
                 .filter(|r| r.error_code().is_some())
+                .map(|r| format!("{r:?}"))
                 .collect();
-            Ok::<_, Error>((failed, format!("{errors:?}")))
+            Ok::<_, Error>(Sent {
+                retry,
+                failed,
+                permanent: Vec::new(),
+            })
         }
     })
     .await
@@ -224,6 +241,50 @@ mod tests {
         assert_eq!(rule.num_calls(), 2);
     }
 
+    fn behind_output(records: &[&str], millis_behind_latest: i64) -> GetRecordsOutput {
+        let mut output = get_output(records, Some("it"));
+        output.millis_behind_latest = Some(millis_behind_latest);
+        output
+    }
+
+    #[tokio::test]
+    async fn get_records_stream_reads_empty_pages_while_behind_latest() {
+        let rule = mock!(Client::get_records)
+            .sequence()
+            .output(|| behind_output(&[], 5000))
+            .output(|| behind_output(&["a"], 1))
+            .output(|| behind_output(&[], 0))
+            .build();
+        let client = mock_client!(aws_sdk_kinesis, RuleMode::MatchAny, [&rule]);
+        let options = AwsPollingOptions {
+            polling_delay: Some(Duration::ZERO),
+            ..Default::default()
+        };
+        let stream = aws_kinesis_get_records_stream(client.get_records(), options);
+        assert_eq!(data(&stream_to_array(stream, None).await.unwrap()), ["a"]);
+        assert_eq!(rule.num_calls(), 3);
+    }
+
+    // The caught-up last page ends the stream with no further wait.
+    #[tokio::test(start_paused = true)]
+    async fn get_records_stream_waits_between_empty_catch_up_pages() {
+        let rule = mock!(Client::get_records)
+            .sequence()
+            .output(|| behind_output(&[], 5000))
+            .output(|| behind_output(&[], 0))
+            .build();
+        let client = mock_client!(aws_sdk_kinesis, RuleMode::MatchAny, [&rule]);
+        let options = AwsPollingOptions {
+            polling_delay: Some(Duration::from_millis(250)),
+            ..Default::default()
+        };
+        let start = tokio::time::Instant::now();
+        let stream = aws_kinesis_get_records_stream(client.get_records(), options);
+        assert!(stream_to_array(stream, None).await.unwrap().is_empty());
+        assert_eq!(start.elapsed(), Duration::from_millis(250));
+        assert_eq!(rule.num_calls(), 2);
+    }
+
     #[tokio::test]
     async fn get_records_stream_aborts_idle_poll() {
         let rule = mock!(Client::get_records).then_output(|| get_output(&[], Some("it")));
@@ -282,6 +343,18 @@ mod tests {
             .unwrap();
         let sizes: Vec<_> = calls.lock().unwrap().iter().map(Vec::len).collect();
         assert_eq!(sizes, [500, 1]);
+    }
+
+    // 11 failures: one more than the default retry_max_count of 10.
+    #[tokio::test(start_paused = true)]
+    async fn put_records_stream_retries_without_limit_at_u32_max() {
+        let (client, calls) = recording_client(vec![vec![true]; 11]);
+        let options = AwsWriteOptions {
+            retry_max_count: Some(u32::MAX),
+            ..Default::default()
+        };
+        put(&client, vec![entry("a", "pk")], options).await.unwrap();
+        assert_eq!(calls.lock().unwrap().len(), 12);
     }
 
     #[tokio::test]
@@ -383,6 +456,29 @@ mod tests {
         assert!(put(&client, vec![hashed], AwsWriteOptions::default())
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn put_records_stream_abort_attaches_buffered_records() {
+        let (client, calls) = recording_client(Vec::new());
+        let signal = CancellationToken::new();
+        let options = AwsWriteOptions {
+            signal: Some(signal.clone()),
+            ..Default::default()
+        };
+        let (sender, input) = datastream_core::create_readable_channel(None);
+        let request = client.put_records().stream_name("s");
+        let task = tokio::spawn(aws_kinesis_put_records_stream(input, request, options));
+        sender.send(entry("a", "pk")).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        signal.cancel();
+        let e = task.await.unwrap().unwrap_err();
+        assert_eq!(e.to_string(), "Aborted");
+        let unsent = e
+            .downcast_ref::<crate::AwsUnsentError<PutRecordsRequestEntry>>()
+            .unwrap();
+        assert_eq!(unsent.failed_messages, [entry("a", "pk")]);
+        assert!(calls.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

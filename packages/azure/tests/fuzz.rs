@@ -235,18 +235,22 @@ proptest! {
     fn fuzz_azure_event_hubs_kafka_mechanism_namespace(namespace in ".{0,60}") {
         let credential = Arc::new(StaticCredential::default());
         let host = namespace.trim_end_matches(":9093");
+        let name = host.strip_suffix(".servicebus.windows.net").unwrap_or(host);
         match azure_event_hubs_kafka_mechanism(&namespace, credential.clone()) {
             Ok(mechanism) => {
-                prop_assert!(!host.is_empty());
+                // Only a bare namespace name reaches the scope's host.
+                prop_assert!(name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'));
                 prop_assert_eq!(mechanism.mechanism, "oauthbearer");
                 let token = runtime().block_on(mechanism.oauth_bearer_provider()).unwrap();
                 prop_assert_eq!(token.value, "token");
                 prop_assert_eq!(token.expiry_time, 1_700_000_000_000);
-                prop_assert_eq!(credential.scopes.lock().unwrap().clone(), vec![format!("https://{host}/.default")]);
+                prop_assert_eq!(credential.scopes.lock().unwrap().clone(), vec![format!("https://{name}.servicebus.windows.net/.default")]);
+            }
+            Err(e) if name.is_empty() => {
+                prop_assert_eq!(e.to_string(), "azureEventHubsKafkaMechanism: namespace required");
             }
             Err(e) => {
-                prop_assert!(host.is_empty());
-                prop_assert_eq!(e.to_string(), "azureEventHubsKafkaMechanism: namespace required");
+                prop_assert!(e.to_string().starts_with("azureEventHubsKafkaMechanism: namespace must be"));
             }
         }
     }

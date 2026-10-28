@@ -69,9 +69,12 @@ fn benches(c: &mut Criterion) {
         group.bench_function(format!("1MB {charset}"), |b| {
             b.to_async(&rt).iter(|| async {
                 let input = create_readable_stream(string_chunks(&text));
-                stream_to_buffer(charset_encode_stream(input, options(charset)), None)
-                    .await
-                    .unwrap()
+                stream_to_buffer(
+                    charset_encode_stream(input, options(charset)).unwrap(),
+                    None,
+                )
+                .await
+                .unwrap()
             })
         });
     }
@@ -81,9 +84,12 @@ fn benches(c: &mut Criterion) {
     group.bench_function("1MB UTF-8", |b| {
         b.to_async(&rt).iter(|| async {
             let input = create_readable_stream(chunks(text.as_bytes()));
-            stream_to_string(charset_decode_stream(input, options("UTF-8")), None)
-                .await
-                .unwrap()
+            stream_to_string(
+                charset_decode_stream(input, options("UTF-8")).unwrap(),
+                None,
+            )
+            .await
+            .unwrap()
         })
     });
     group.finish();
@@ -92,10 +98,13 @@ fn benches(c: &mut Criterion) {
     group.bench_function("1MB UTF-8 encode -> decode", |b| {
         b.to_async(&rt).iter(|| async {
             let input = create_readable_stream(string_chunks(&text));
-            let encoded = charset_encode_stream(input, options("UTF-8"));
-            stream_to_string(charset_decode_stream(encoded, options("UTF-8")), None)
-                .await
-                .unwrap()
+            let encoded = charset_encode_stream(input, options("UTF-8")).unwrap();
+            stream_to_string(
+                charset_decode_stream(encoded, options("UTF-8")).unwrap(),
+                None,
+            )
+            .await
+            .unwrap()
         })
     });
     group.finish();

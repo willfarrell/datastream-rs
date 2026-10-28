@@ -3,7 +3,7 @@
 //! CSV parsing and formatting streams, ported from `@datastream/csv`.
 //!
 //! Text goes in as `String` chunks; parsed rows come out as `Value::Array`s of
-//! strings. Lengths and `field_max_size` are measured in bytes.
+//! strings. Lengths and `max_field_size` are measured in bytes.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
@@ -21,7 +21,9 @@ use serde_json::json;
 const DEFAULT_DELIMITER: &str = ",";
 const DEFAULT_NEWLINE: &str = "\r\n";
 const DEFAULT_QUOTE: &str = "\"";
-const DEFAULT_FIELD_MAX_SIZE: usize = 16_777_216; // 16MB
+const DEFAULT_MAX_FIELD_SIZE: usize = 16_777_216; // 16MB
+const DEFAULT_MAX_BUFFER_SIZE: usize = 16_777_216; // 16MB
+const DEFAULT_MAX_ERROR_ROWS: usize = 1_000;
 
 // *** Options *** //
 
@@ -79,7 +81,8 @@ pub struct ParserOptions {
     pub quote_char: String,
     /// Defaults to `quote_char` (doubled-quote escaping).
     pub escape_char: Option<String>,
-    pub field_max_size: usize,
+    /// Largest field in bytes; quoted and unquoted fields are both checked.
+    pub max_field_size: usize,
     pub num_cols: usize,
     pub idx: usize,
 }
@@ -91,7 +94,7 @@ impl Default for ParserOptions {
             newline_char: DEFAULT_NEWLINE.into(),
             quote_char: DEFAULT_QUOTE.into(),
             escape_char: None,
-            field_max_size: usize::MAX,
+            max_field_size: usize::MAX,
             num_cols: 0,
             idx: 0,
         }
@@ -148,7 +151,7 @@ fn resolve_parser_options(
     newline_char: &Option<LazyString>,
     quote_char: &Option<LazyString>,
     escape_char: &Option<LazyString>,
-    field_max_size: usize,
+    max_field_size: usize,
 ) -> ParserOptions {
     let resolve = |o: &Option<LazyString>, default: &str| {
         o.as_ref()
@@ -161,7 +164,7 @@ fn resolve_parser_options(
         newline_char: resolve(newline_char, DEFAULT_NEWLINE),
         escape_char: Some(resolve(escape_char, quote.as_str())),
         quote_char: quote,
-        field_max_size,
+        max_field_size,
         num_cols: 0,
         idx: 0,
     }
@@ -181,27 +184,25 @@ fn row_value(row: Vec<String>) -> Value {
     Value::Array(row.into_iter().map(Value::String).collect())
 }
 
-fn errors_value(errors: &CsvErrors) -> Value {
-    Value::Object(
-        errors
-            .iter()
-            .map(|(k, e)| {
-                (
-                    k.clone(),
-                    json!({"id": e.id, "message": e.message, "idx": e.idx}),
-                )
-            })
-            .collect(),
-    )
-}
-
-fn track_error(result: &StreamResult, id: &str, message: &str, idx: usize) {
+/// Records failing row indexes under `id`, keeping at most `max_error_rows`
+/// of them (so the result stays bounded on large/untrusted input) while
+/// `count` tracks the true total.
+fn record_error_rows(
+    result: &StreamResult,
+    id: &str,
+    message: &str,
+    rows: &[usize],
+    max_error_rows: usize,
+) {
     result.update(|v| {
         if v.get(id).is_none() {
-            v[id] = json!({"id": id, "message": message, "idx": []});
+            v[id] = json!({"id": id, "message": message, "idx": [], "count": 0});
         }
-        if let Some(list) = v[id]["idx"].as_array_mut() {
-            list.push(json!(idx));
+        let error = &mut v[id];
+        error["count"] = json!(error["count"].as_u64().unwrap_or(0) + rows.len() as u64);
+        if let Some(list) = error["idx"].as_array_mut() {
+            let take = rows.len().min(max_error_rows.saturating_sub(list.len()));
+            list.extend(rows[..take].iter().map(|&i| json!(i)));
         }
     });
 }
@@ -231,7 +232,8 @@ fn find_row_end(text: &str, options: &ParserOptions) -> Option<usize> {
     let mut pos = 0;
     let mut next_nl = find(text, newline, 0);
     loop {
-        // `pos` is always a field start here, so a quote opens a quoted field.
+        // `pos` is a field start here, or (escape == quote only) just past a
+        // quote where a second quote continues the field as an escaped "" pair.
         if !quote.is_empty() && text[pos..].starts_with(quote) {
             let content_start = pos + quote.len();
             let mut close = find(text, quote, content_start);
@@ -240,7 +242,14 @@ fn find_row_end(text: &str, options: &ParserOptions) -> Option<usize> {
                 close = find(text, quote, i + quote.len());
             }
             pos = close? + quote.len();
-            continue;
+            // When escape == quote a quote right after this one is the second
+            // half of an escaped "" pair, so re-enter the quoted-field scan.
+            // Otherwise fall through: text after a closing quote (up to the next
+            // delimiter/newline) is literal, as in the parser, so a quote there
+            // does not open another quoted field.
+            if escape == quote {
+                continue;
+            }
         }
         if next_nl.is_some_and(|n| n < pos) {
             next_nl = find(text, newline, pos);
@@ -278,47 +287,75 @@ fn unescape_custom(text: &str, escape: &str) -> String {
 
 #[derive(Clone, Debug, Default)]
 pub struct CsvDetectDelimitersOptions {
+    /// Largest first line buffered while waiting for a newline, in bytes
+    /// (default 16MB; `usize::MAX` for unlimited).
+    pub max_buffer_size: Option<usize>,
     pub result_key: Option<String>,
 }
 
-fn detect_delimiters(text: &str) -> Option<[&'static str; 3]> {
+/// `(delimiter, newline, quote)`; the newline is `None` when unknown.
+type Delimiters = (&'static str, Option<&'static str>, &'static str);
+
+/// Detect from the first line, or `None` until a complete first line is
+/// buffered. When `flushing` with no newline, the whole text is the header line.
+fn detect_delimiters(text: &str, flushing: bool) -> Option<Delimiters> {
     let text = strip_bom(text);
-    let end = text.find(['\r', '\n'])?;
-    let newline = if text[end..].starts_with("\r\n") {
-        "\r\n"
-    } else if text[end..].starts_with('\r') {
-        "\r"
-    } else {
-        "\n"
+    let (header, newline) = match text.find(['\r', '\n']) {
+        Some(end) => {
+            let newline = if text[end..].starts_with("\r\n") {
+                "\r\n"
+            } else if text[end..].starts_with('\r') {
+                "\r"
+            } else {
+                "\n"
+            };
+            // A bare CR at the very end of the buffer may be the first half of a
+            // CRLF split across chunks, so wait for more data unless ending.
+            if !flushing && newline == "\r" && end + 1 == text.len() {
+                return None;
+            }
+            (&text[..end], Some(newline))
+        }
+        None if flushing => (text, None),
+        None => return None,
     };
-    let header = &text[..end];
     let delimiter = ["\t", "|", ";", ","]
         .into_iter()
         .find(|d| header.contains(*d))
         .unwrap_or(DEFAULT_DELIMITER);
 
     // A char is the quote char only when it BRACKETS a field: it opens at a
-    // field start and a matching quote closes right before a field end.
-    let bytes = text.as_bytes();
-    let field_start = |i: usize| {
-        i == 0 || text[..i].ends_with(delimiter) || matches!(bytes[i - 1], b'\r' | b'\n')
-    };
+    // field start (line start, or right after a delimiter) and a matching quote
+    // closes right before a field end (delimiter/newline/end).
+    // Like the delimiter, the quote char is detected from the header line
+    // only: scanning the whole buffer made the result depend on chunking.
+    let line = &text[..header.len() + newline.map_or(0, str::len)];
+    let bytes = line.as_bytes();
+    let field_start = |i: usize| i == 0 || line[..i].ends_with(delimiter);
     let field_end = |i: usize| {
-        i >= text.len() || text[i..].starts_with(delimiter) || matches!(bytes[i], b'\r' | b'\n')
+        i >= line.len() || line[i..].starts_with(delimiter) || matches!(bytes[i], b'\r' | b'\n')
     };
+    // Only the FIRST field-start opener needs checking: any closer that pairs
+    // with a later opener also follows (and so pairs with) the first one. One
+    // forward pass per candidate keeps this O(n); retrying every opener against
+    // every later quote was O(n^2) (a CPU DoS on a long crafted first line).
     let brackets = |q: &str| {
-        let mut open = find(text, q, 0);
+        let mut open = find(line, q, 0);
         while let Some(i) = open {
             if field_start(i) {
-                let mut close = find(text, q, i + 1);
-                while let Some(c) = close {
-                    if field_end(c + 1) {
-                        return true;
-                    }
-                    close = find(text, q, c + 1);
-                }
+                break;
             }
-            open = find(text, q, i + 1);
+            open = find(line, q, i + 1);
+        }
+        let Some(open) = open else {
+            return false;
+        };
+        let mut close = find(line, q, open + 1);
+        while let Some(c) = close {
+            if field_end(c + 1) {
+                return true;
+            }
+            close = find(line, q, c + 1);
         }
         false
     };
@@ -326,7 +363,7 @@ fn detect_delimiters(text: &str) -> Option<[&'static str; 3]> {
         .into_iter()
         .find(|q| brackets(q))
         .unwrap_or(DEFAULT_QUOTE);
-    Some([delimiter, newline, quote])
+    Some((delimiter, newline, quote))
 }
 
 /// Pass text through unchanged while detecting the delimiter, newline and
@@ -336,6 +373,7 @@ pub fn csv_detect_delimiters_stream(
     input: DataStream<String>,
     options: CsvDetectDelimitersOptions,
 ) -> (DataStream<String>, StreamResult) {
+    let max_buffer_size = options.max_buffer_size.unwrap_or(DEFAULT_MAX_BUFFER_SIZE);
     let key = options
         .result_key
         .unwrap_or_else(|| "csvDetectDelimiters".into());
@@ -344,8 +382,8 @@ pub fn csv_detect_delimiters_stream(
         json!({"delimiterChar": null, "newlineChar": null, "quoteChar": null, "escapeChar": null}),
     );
     let r = result.clone();
-    let detect = move |text: &str| match detect_delimiters(text) {
-        Some([delimiter, newline, quote]) => {
+    let detect = move |text: &str, flushing: bool| match detect_delimiters(text, flushing) {
+        Some((delimiter, newline, quote)) => {
             r.set(json!({
                 "delimiterChar": delimiter,
                 "newlineChar": newline,
@@ -360,6 +398,10 @@ pub fn csv_detect_delimiters_stream(
         let mut input = input;
         let mut buffer = String::new();
         let mut detected = false;
+        // Detection cannot succeed before the first CR/LF arrives, so it is
+        // skipped until one is seen: rescanning the growing buffer on every chunk
+        // of a long first line was O(n^2).
+        let mut newline_seen = false;
         while let Some(chunk) = input.next().await {
             let chunk = chunk?;
             if detected {
@@ -368,14 +410,20 @@ pub fn csv_detect_delimiters_stream(
             }
             // Detection succeeds once a complete first line is buffered.
             buffer.push_str(&chunk);
-            if detect(buffer.as_str()) {
+            newline_seen = newline_seen || chunk.contains(['\r', '\n']);
+            if newline_seen && detect(buffer.as_str(), false) {
                 detected = true;
                 yield std::mem::take(&mut buffer);
+            } else if buffer.len() > max_buffer_size {
+                Err::<(), Error>(format!(
+                    "csvDetectDelimitersStream buffer ({}) exceeds maxBufferSize ({max_buffer_size}), newline not found",
+                    buffer.len()
+                ).into())?;
             }
         }
         if !detected && !buffer.is_empty() {
             // Detect from whatever was buffered (may be a partial line).
-            detect(buffer.as_str());
+            detect(buffer.as_str(), true);
             yield buffer;
         }
     });
@@ -384,6 +432,9 @@ pub fn csv_detect_delimiters_stream(
 
 #[derive(Clone, Debug, Default)]
 pub struct CsvDetectHeaderOptions {
+    /// Largest header row buffered while waiting for its end, in bytes
+    /// (default 16MB; `usize::MAX` for unlimited).
+    pub max_buffer_size: Option<usize>,
     pub parser: CsvParser,
     pub delimiter_char: Option<LazyString>,
     pub newline_char: Option<LazyString>,
@@ -419,12 +470,19 @@ pub fn csv_detect_header_stream(
         .result_key
         .clone()
         .unwrap_or_else(|| "csvDetectHeader".into());
+    let max_buffer_size = options.max_buffer_size.unwrap_or(DEFAULT_MAX_BUFFER_SIZE);
     let result = StreamResult::new(key, json!({}));
     let r = result.clone();
     let stream: DataStream<String> = Box::pin(try_stream! {
         let mut input = input;
         let mut buffer = String::new();
         let mut detected = false;
+        // Buffer length at which to retry locating the header row end.
+        // Re-scanning the growing buffer on every chunk of a long header row
+        // was O(n^2); retrying only once the buffer has doubled since the last
+        // failed attempt is amortised O(n). Capped just past maxBufferSize so
+        // the limit is still enforced as soon as it is exceeded.
+        let mut next_attempt = 0;
         let mut resolved: Option<ParserOptions> = None;
         let resolve = || resolve_parser_options(
             &options.delimiter_char,
@@ -440,6 +498,9 @@ pub fn csv_detect_header_stream(
                 continue;
             }
             buffer.push_str(&chunk);
+            if buffer.len() < next_attempt {
+                continue;
+            }
             let opts = resolved.get_or_insert_with(resolve);
             let text = strip_bom(&buffer);
             // Process as soon as a complete header row (quote aware) is buffered.
@@ -448,6 +509,16 @@ pub fn csv_detect_header_stream(
                 if let Some(rest) = process_header(text, Some(end), opts, &options.parser, &r)? {
                     yield rest;
                 }
+            } else if buffer.len() > max_buffer_size {
+                Err::<(), Error>(format!(
+                    "csvDetectHeaderStream buffer ({}) exceeds maxBufferSize ({max_buffer_size}), header row not found",
+                    buffer.len()
+                ).into())?;
+            } else {
+                next_attempt = buffer
+                    .len()
+                    .saturating_mul(2)
+                    .min(max_buffer_size.saturating_add(1));
             }
         }
         if !detected {
@@ -466,12 +537,25 @@ pub fn csv_detect_header_stream(
 // *** Parsers *** //
 
 fn field_too_big(len: usize, max: usize) -> Error {
-    format!("CSV field size ({len}) exceeds fieldMaxSize ({max} bytes)").into()
+    format!("CSV field size ({len}) exceeds maxFieldSize ({max} bytes)").into()
+}
+
+fn track_parse_error(errors: &mut CsvErrors, id: &str, message: &str, idx: usize) {
+    errors
+        .entry(id.into())
+        .or_insert_with(|| CsvError {
+            id: id.into(),
+            message: message.into(),
+            idx: Vec::new(),
+        })
+        .idx
+        .push(idx);
 }
 
 /// Quote-aware parser. Returns complete rows and the unparsed `tail`; on
 /// `is_flushing` the tail is parsed too and an unterminated quote is recorded
-/// as an `UnterminatedQuote` error.
+/// as an `UnterminatedQuote` error. Text after a closing quote (`"a"x,b`) is
+/// kept in the same field (`ax`) and recorded as `UnexpectedQuote`.
 pub fn csv_quoted_parser(
     text: &str,
     options: &ParserOptions,
@@ -490,6 +574,13 @@ pub fn csv_quoted_parser(
             unescape_custom(s, escape)
         }
     };
+    // Every field (quoted or not) is size-checked.
+    let sized = |field: String| {
+        if field.len() > options.max_field_size {
+            return Err(field_too_big(field.len(), options.max_field_size));
+        }
+        Ok(field)
+    };
 
     let len = text.len();
     let mut out = ParseResult {
@@ -505,11 +596,37 @@ pub fn csv_quoted_parser(
     // First delimiter/newline at or after pos, cached so each is found once.
     let mut next_nl = find(text, newline, 0);
     let mut next_delim = find(text, delimiter, 0);
+    // Text after a closing quote (e.g. `"a"x,b`) is malformed. It is kept in
+    // the same field (appended to the quoted value, up to the next
+    // delimiter/newline) so the row's field count stays correct. This holds the
+    // quoted value while that trailing text is scanned as an unquoted field.
+    let mut quoted_prefix: Option<String> = None;
+    // Set when the current row contains text after a closing quote. The error
+    // is only recorded when the row is emitted, because an incomplete row is
+    // handed back as the tail and re-parsed with the next chunk (recording it
+    // here would count it twice).
+    let mut row_has_unexpected_quote = false;
+    let emit = |out: &mut ParseResult, fields: Vec<String>, unexpected_quote: bool| {
+        if unexpected_quote {
+            track_parse_error(
+                &mut out.errors,
+                "UnexpectedQuote",
+                "Unexpected text after closing quote",
+                out.idx,
+            );
+        }
+        if out.num_cols == 0 {
+            out.num_cols = fields.len();
+        }
+        out.rows.push(fields);
+        out.idx += 1;
+    };
 
     while pos < len {
         // The loop is only entered at a field start, so a quote here opens a
-        // quoted field (mid-field quotes are literal).
-        if !quote.is_empty() && text[pos..].starts_with(quote) {
+        // quoted field (mid-field quotes are literal) — unless it directly
+        // follows a closing quote, in which case it is part of the malformed text.
+        if quoted_prefix.is_none() && !quote.is_empty() && text[pos..].starts_with(quote) {
             last_was_delimiter = false;
             pos += quote.len();
             let content_start = pos;
@@ -531,49 +648,54 @@ pub fn csv_quoted_parser(
             let Some(close) = close else {
                 // Unterminated quote
                 if is_flushing {
-                    out.errors.insert(
-                        "UnterminatedQuote".into(),
-                        CsvError {
-                            id: "UnterminatedQuote".into(),
-                            message: "Unterminated quoted field".into(),
-                            idx: vec![out.idx],
-                        },
+                    track_parse_error(
+                        &mut out.errors,
+                        "UnterminatedQuote",
+                        "Unterminated quoted field",
+                        out.idx,
                     );
                     fields.push(unescape(&text[content_start..]));
-                    if out.num_cols == 0 {
-                        out.num_cols = fields.len();
-                    }
-                    out.rows.push(fields);
-                    out.idx += 1;
+                    emit(
+                        &mut out,
+                        fields,
+                        std::mem::take(&mut row_has_unexpected_quote),
+                    );
                 } else {
                     out.tail = text[row_start..].to_string();
                 }
                 return Ok(out);
             };
 
-            let field = unescape(&text[content_start..close]);
-            if field.len() > options.field_max_size {
-                return Err(field_too_big(field.len(), options.field_max_size));
-            }
+            let field = sized(unescape(&text[content_start..close]))?;
             pos = close + quote.len();
-            fields.push(field);
 
-            // Post-quote dispatch: delimiter, newline, or garbage / end of input.
+            // Post-quote dispatch: delimiter, newline, end of input, or
+            // unexpected text after the closing quote.
             if text[pos..].starts_with(delimiter) {
+                fields.push(field);
                 pos += delimiter.len();
                 field_start = pos;
                 last_was_delimiter = true;
             } else if text[pos..].starts_with(newline) {
-                if out.num_cols == 0 {
-                    out.num_cols = fields.len();
-                }
-                out.rows.push(std::mem::take(&mut fields));
-                out.idx += 1;
+                fields.push(field);
+                emit(
+                    &mut out,
+                    std::mem::take(&mut fields),
+                    std::mem::take(&mut row_has_unexpected_quote),
+                );
                 pos += newline.len();
                 row_start = pos;
                 field_start = pos;
                 last_was_delimiter = false;
+            } else if pos == len {
+                // End of input: record the field and let the loop terminate.
+                fields.push(field);
+                field_start = pos;
             } else {
+                // Unexpected text after the closing quote: scan it as an
+                // unquoted field.
+                quoted_prefix = Some(field);
+                row_has_unexpected_quote = true;
                 field_start = pos;
             }
             continue;
@@ -587,26 +709,29 @@ pub fn csv_quoted_parser(
         if next_delim.is_some_and(|d| d < pos) {
             next_delim = find(text, delimiter, pos);
         }
+        let prefix = quoted_prefix.take().unwrap_or_default();
         if let Some(d) = next_delim.filter(|&d| !matches!(next_nl, Some(n) if n < d)) {
             // Terminated by a delimiter (which wins a tie with the newline).
-            fields.push(text[field_start..d].to_string());
+            fields.push(sized(prefix + &text[field_start..d])?);
             pos = d + delimiter.len();
             field_start = pos;
             last_was_delimiter = true;
             continue;
         }
         if let Some(n) = next_nl {
-            fields.push(text[field_start..n].to_string());
-            if out.num_cols == 0 {
-                out.num_cols = fields.len();
-            }
-            out.rows.push(std::mem::take(&mut fields));
-            out.idx += 1;
+            fields.push(sized(prefix + &text[field_start..n])?);
+            emit(
+                &mut out,
+                std::mem::take(&mut fields),
+                std::mem::take(&mut row_has_unexpected_quote),
+            );
             pos = n + newline.len();
             row_start = pos;
             field_start = pos;
             continue;
         }
+        // No terminator: keep the prefix for the trailing field on flush.
+        quoted_prefix = Some(prefix);
         break;
     }
 
@@ -616,16 +741,17 @@ pub fn csv_quoted_parser(
     }
     // Flushing: emit any trailing field or the empty field of a dangling delimiter.
     if field_start < len {
-        fields.push(text[field_start..].to_string());
+        let prefix = quoted_prefix.unwrap_or_default();
+        fields.push(sized(prefix + &text[field_start..])?);
     } else if last_was_delimiter {
         fields.push(String::new());
     }
     if !fields.is_empty() {
-        if out.num_cols == 0 {
-            out.num_cols = fields.len();
-        }
-        out.rows.push(fields);
-        out.idx += 1;
+        emit(
+            &mut out,
+            fields,
+            std::mem::take(&mut row_has_unexpected_quote),
+        );
     }
     Ok(out)
 }
@@ -671,8 +797,12 @@ pub fn csv_unquoted_parser(
 #[derive(Clone, Debug, Default)]
 pub struct CsvParseOptions {
     pub parser: CsvParser,
-    /// Defaults to 16MB. Text buffered beyond twice this is an error.
-    pub field_max_size: Option<usize>,
+    /// Largest field in bytes (default 16MB; `usize::MAX` for unlimited). An
+    /// incomplete row buffered beyond twice this is an error.
+    pub max_field_size: Option<usize>,
+    /// Row indexes kept per error id (default 1,000; `usize::MAX` for
+    /// unlimited). `count` always records the true total.
+    pub max_error_rows: Option<usize>,
     pub delimiter_char: Option<LazyString>,
     pub newline_char: Option<LazyString>,
     pub quote_char: Option<LazyString>,
@@ -680,20 +810,15 @@ pub struct CsvParseOptions {
     pub result_key: Option<String>,
 }
 
-fn merge_errors(errors: &mut CsvErrors, incoming: CsvErrors) {
+fn merge_errors(result: &StreamResult, incoming: CsvErrors, max_error_rows: usize) {
     for (id, error) in incoming {
-        match errors.get_mut(&id) {
-            Some(existing) => existing.idx.extend(error.idx),
-            None => {
-                errors.insert(id, error);
-            }
-        }
+        record_error_rows(result, &id, &error.message, &error.idx, max_error_rows);
     }
 }
 
 /// Parse CSV text into rows (`Value::Array` of strings), buffering partial rows
-/// across chunks. Result key defaults to "csvErrors"; value maps error id to
-/// `{id, message, idx}`.
+/// across chunks. A leading BOM is stripped. Result key defaults to
+/// "csvErrors"; value maps error id to `{id, message, idx, count}`.
 pub fn csv_parse_stream(
     input: DataStream<String>,
     options: CsvParseOptions,
@@ -704,39 +829,57 @@ pub fn csv_parse_stream(
         .unwrap_or_else(|| "csvErrors".into());
     let result = StreamResult::new(key, json!({}));
     let r = result.clone();
-    let field_max_size = options.field_max_size.unwrap_or(DEFAULT_FIELD_MAX_SIZE);
+    let max_field_size = options.max_field_size.unwrap_or(DEFAULT_MAX_FIELD_SIZE);
+    let max_error_rows = options.max_error_rows.unwrap_or(DEFAULT_MAX_ERROR_ROWS);
     let stream: DataStream<Value> = Box::pin(try_stream! {
         let mut input = input;
         let parser = options.parser.0.clone();
         let mut resolved: Option<ParserOptions> = None;
         let mut buffer = String::new();
-        let mut errors = CsvErrors::new();
+        // Buffer length at which to re-parse an incomplete row (the parse
+        // tail). Re-parsing the tail from its start on every chunk of a long
+        // row was O(n^2); retrying only once the buffer has doubled is
+        // amortised O(n). A row can only complete once more data arrives, so
+        // skipping is safe; with no pending tail (0) every chunk is parsed.
+        let mut next_parse = 0;
+        // A BOM is only meaningful at the very start of the stream. An empty
+        // chunk must not consume the check.
+        let mut first_chunk = true;
         // Lazy options are resolved once the first chunk arrives (upstream has run).
         let resolve = || resolve_parser_options(
             &options.delimiter_char,
             &options.newline_char,
             &options.quote_char,
             &options.escape_char,
-            field_max_size,
+            max_field_size,
         );
         while let Some(chunk) = input.next().await {
             let chunk = chunk?;
             let ctx = resolved.get_or_insert_with(resolve);
-            buffer.push_str(&chunk);
-            if buffer.len() > ctx.field_max_size.saturating_mul(2) {
-                Err::<(), Error>(format!(
-                    "CSV buffer size ({}) exceeds safety limit, likely unterminated quoted field",
-                    buffer.len()
-                ).into())?;
+            if first_chunk && !chunk.is_empty() {
+                first_chunk = false;
+                buffer.push_str(strip_bom(&chunk));
+            } else {
+                buffer.push_str(&chunk);
+            }
+            if buffer.len() < next_parse {
+                continue;
             }
             let parsed = parser(buffer.as_str(), &*ctx, false)?;
             ctx.num_cols = parsed.num_cols;
             ctx.idx = parsed.idx;
             buffer = parsed.tail;
-            if !parsed.errors.is_empty() {
-                merge_errors(&mut errors, parsed.errors);
-                r.set(errors_value(&errors));
+            // Only the unparsed tail (an incomplete row) can grow without bound,
+            // e.g. an unterminated quote. Checking the whole chunk rejected large
+            // inputs made of small rows.
+            if buffer.len() > ctx.max_field_size.saturating_mul(2) {
+                Err::<(), Error>(format!(
+                    "CSV buffer size ({}) exceeds safety limit, likely unterminated quoted field",
+                    buffer.len()
+                ).into())?;
             }
+            next_parse = buffer.len().saturating_mul(2);
+            merge_errors(&r, parsed.errors, max_error_rows);
             for row in parsed.rows {
                 yield row_value(row);
             }
@@ -744,10 +887,7 @@ pub fn csv_parse_stream(
         let ctx = resolved.get_or_insert_with(resolve);
         if !buffer.is_empty() {
             let parsed = parser(buffer.as_str(), &*ctx, true)?;
-            if !parsed.errors.is_empty() {
-                merge_errors(&mut errors, parsed.errors);
-                r.set(errors_value(&errors));
-            }
+            merge_errors(&r, parsed.errors, max_error_rows);
             for row in parsed.rows {
                 yield row_value(row);
             }
@@ -767,6 +907,9 @@ pub struct CsvRemoveMalformedRowsOptions {
     /// Expected columns; defaults to the first row's field count.
     pub headers: Option<Keys>,
     pub on_error_enqueue: bool,
+    /// Row indexes kept (default 1,000; `usize::MAX` for unlimited). `count`
+    /// always records the true total.
+    pub max_error_rows: Option<usize>,
     pub result_key: Option<String>,
 }
 
@@ -783,6 +926,7 @@ pub fn csv_remove_malformed_rows_stream(
     let r = result.clone();
     let headers = options.headers;
     let on_error_enqueue = options.on_error_enqueue;
+    let max_error_rows = options.max_error_rows.unwrap_or(DEFAULT_MAX_ERROR_ROWS);
     let mut expected: Option<usize> = None;
     let mut idx = 0;
     let stream = create_transform_stream(
@@ -792,11 +936,12 @@ pub fn csv_remove_malformed_rows_stream(
             let expected = *expected
                 .get_or_insert_with(|| headers.as_ref().map_or(len, |h| object_headers(h).len()));
             if len != expected {
-                track_error(
+                record_error_rows(
                     &r,
                     "MalformedRow",
                     "Row has incorrect number of fields",
-                    idx,
+                    &[idx],
+                    max_error_rows,
                 );
                 if on_error_enqueue {
                     enqueue.push(chunk);
@@ -815,6 +960,9 @@ pub fn csv_remove_malformed_rows_stream(
 #[derive(Clone, Debug, Default)]
 pub struct CsvRemoveEmptyRowsOptions {
     pub on_error_enqueue: bool,
+    /// Row indexes kept (default 1,000; `usize::MAX` for unlimited). `count`
+    /// always records the true total.
+    pub max_error_rows: Option<usize>,
     pub result_key: Option<String>,
 }
 
@@ -830,6 +978,7 @@ pub fn csv_remove_empty_rows_stream(
     let result = StreamResult::new(key, json!({}));
     let r = result.clone();
     let on_error_enqueue = options.on_error_enqueue;
+    let max_error_rows = options.max_error_rows.unwrap_or(DEFAULT_MAX_ERROR_ROWS);
     let mut idx = 0;
     let stream = create_transform_stream(
         input,
@@ -839,7 +988,7 @@ pub fn csv_remove_empty_rows_stream(
                 None => true,
             };
             if empty {
-                track_error(&r, "EmptyRow", "Row is empty", idx);
+                record_error_rows(&r, "EmptyRow", "Row is empty", &[idx], max_error_rows);
                 if on_error_enqueue {
                     enqueue.push(chunk);
                 }
@@ -872,7 +1021,6 @@ pub enum CsvCoerceType {
 pub struct CsvCoerceValuesOptions {
     /// Explicit column types; other columns are auto-coerced.
     pub columns: HashMap<String, CsvCoerceType>,
-    pub result_key: Option<String>,
 }
 
 // `^-?\d+(\.\d+)?([eE][+-]?\d+)?$`
@@ -1164,17 +1312,13 @@ fn coerce_to_type(val: Value, kind: CsvCoerceType) -> Value {
 }
 
 /// Convert string values to numbers, booleans, null, dates and JSON, either
-/// automatically or per `columns`. Result key defaults to "csvCoerceValues".
+/// automatically or per `columns`. Adds no result entry.
 pub fn csv_coerce_values_stream(
     input: DataStream<Value>,
     options: CsvCoerceValuesOptions,
-) -> (DataStream<Value>, StreamResult) {
-    let key = options
-        .result_key
-        .unwrap_or_else(|| "csvCoerceValues".into());
-    let result = StreamResult::new(key, json!({}));
+) -> DataStream<Value> {
     let columns = options.columns;
-    let stream = create_transform_stream(
+    create_transform_stream(
         input,
         move |chunk: Value, enqueue: &mut Vec<Value>| {
             let Value::Object(map) = chunk else {
@@ -1195,8 +1339,7 @@ pub fn csv_coerce_values_stream(
             Ok(())
         },
         noop_flush,
-    );
-    (stream, result)
+    )
 }
 
 // *** Formatting *** //
@@ -1232,10 +1375,15 @@ pub struct CsvFormatOptions {
     pub quote_char: Option<String>,
     /// Defaults to `quote_char`.
     pub escape_char: Option<String>,
+    /// Prefix formula-like cells (`= + - @` TAB CR, except plain signed
+    /// numbers) with `'` so spreadsheets treat them as text. Default `true`.
+    pub escape_formulae: Option<bool>,
 }
 
 struct Formatter {
     delimiter: String,
+    newline: String,
+    escape_formulae: bool,
     quote: String,
     escape: String,
     escaped_quote: String,
@@ -1263,7 +1411,8 @@ fn js_number_string(n: &serde_json::Number) -> String {
 
 impl Formatter {
     // Quote fields starting with a formula/whitespace/BOM trigger, ending with
-    // a space, or containing the delimiter, the quote char, CR or LF.
+    // a space, or containing the delimiter, the quote char, CR, LF or the
+    // newline.
     fn needs_quote(&self, v: &str) -> bool {
         matches!(
             v.chars().next(),
@@ -1273,6 +1422,22 @@ impl Formatter {
             || v.contains(self.quote.as_str())
             || v.contains('\r')
             || v.contains('\n')
+            || v.contains(self.newline.as_str())
+    }
+
+    // CSV/formula injection: spreadsheets evaluate a cell starting with = + - @
+    // (and TAB/CR, which some strip first) even when the field is quoted, so
+    // it is prefixed with a ' to make it text. Plain signed numbers
+    // (`^[+-]\d+(\.\d+)?([eE][+-]?\d+)?$`) are left untouched.
+    fn is_formula(v: &str) -> bool {
+        match v.chars().next() {
+            Some('=' | '@' | '\t' | '\r') => true,
+            Some('+' | '-') => {
+                let rest = &v[1..];
+                rest.starts_with('-') || !is_number_like(rest)
+            }
+            _ => false,
+        }
     }
 
     fn field(&self, raw: &Value) -> String {
@@ -1282,6 +1447,11 @@ impl Formatter {
             Value::Number(n) => js_number_string(n),
             Value::Bool(b) => b.to_string(),
             other => other.to_string(),
+        };
+        let val = if self.escape_formulae && Self::is_formula(&val) {
+            format!("'{val}")
+        } else {
+            val
         };
         if !self.needs_quote(&val) {
             return val;
@@ -1321,6 +1491,8 @@ pub fn csv_format_stream(
         delimiter: options
             .delimiter_char
             .unwrap_or_else(|| DEFAULT_DELIMITER.into()),
+        newline: newline.clone(),
+        escape_formulae: options.escape_formulae.unwrap_or(true),
         escaped_quote: format!("{escape}{quote}"),
         escaped_escape: format!("{escape}{escape}"),
         quote,
@@ -1355,7 +1527,7 @@ fn object_headers(headers: &Keys) -> Vec<String> {
 }
 
 /// Row array -> object keyed by `headers` (resolved on the first row).
-pub fn csv_array_to_object(
+pub fn csv_array_to_object_stream(
     input: DataStream<Value>,
     options: CsvHeadersOptions,
 ) -> DataStream<Value> {
@@ -1378,7 +1550,7 @@ pub fn csv_array_to_object(
 }
 
 /// Object -> row array ordered by `headers`.
-pub fn csv_object_to_array(
+pub fn csv_object_to_array_stream(
     input: DataStream<Value>,
     options: CsvHeadersOptions,
 ) -> DataStream<Value> {

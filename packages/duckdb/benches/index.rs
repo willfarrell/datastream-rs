@@ -99,7 +99,7 @@ fn benches(c: &mut Criterion) {
                 let options = DuckdbOptions {
                     db: db.clone(),
                     table,
-                    schema: Some(self::schema()),
+                    schema: Some(self::schema().into()),
                 };
                 let input = create_readable_stream(rows.clone());
                 async move { duckdb_appender_stream(input, options).await.unwrap() }

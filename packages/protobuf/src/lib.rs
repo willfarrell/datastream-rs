@@ -17,6 +17,12 @@ pub use prost_reflect;
 use prost_reflect::prost::Message;
 use prost_reflect::{DeserializeOptions, DynamicMessage, MessageDescriptor, SerializeOptions};
 
+/// Default per-message ceiling: a hostile length prefix (unframe) or
+/// oversized payload (decode) must not force an unbounded buffer/decode.
+pub const DEFAULT_MAX_MESSAGE_SIZE: usize = 64 * 1024 * 1024;
+// A base-128 varint encodes at most 64 bits in 10 bytes.
+const MAX_PREFIX_BYTES: usize = 10;
+
 pub type ResolveType<I> = Arc<dyn Fn(&I) -> BoxFuture<Result<MessageDescriptor>> + Send + Sync>;
 
 /// The message type: fixed, or resolved per chunk (e.g. from a schema id).
@@ -83,8 +89,16 @@ pub fn protobuf_encode_stream(
 
 pub struct ProtobufDecodeOptions<I> {
     pub type_: ProtobufType<I>,
-    /// Limit on the total input bytes (default unlimited).
-    pub max_output_size: Option<usize>,
+    /// Largest accepted message in bytes (default 64MiB; `usize::MAX` for
+    /// none).
+    pub max_message_size: Option<usize>,
+}
+
+fn check_size(len: usize, max: usize) -> Result<()> {
+    if len > max {
+        return Err(format!("Protobuf message exceeds maxMessageSize ({max} bytes)").into());
+    }
+    Ok(())
 }
 
 fn decode(desc: MessageDescriptor, bytes: &[u8]) -> Result<Value> {
@@ -102,17 +116,13 @@ pub fn protobuf_decode_stream<I>(
 where
     I: AsRef<[u8]> + Send + 'static,
 {
-    let max = options.max_output_size.unwrap_or(usize::MAX);
+    let max = options.max_message_size.unwrap_or(DEFAULT_MAX_MESSAGE_SIZE);
+    // Checked per message, not cumulatively: a cumulative cap with any finite
+    // default would eventually kill every long-lived consumer.
     Box::pin(try_stream! {
-        let mut input_size = 0usize;
         while let Some(chunk) = input.next().await {
             let chunk = chunk?;
-            input_size = input_size.saturating_add(chunk.as_ref().len());
-            if input_size > max {
-                Err::<(), Error>(
-                    format!("Protobuf decode input exceeds maxOutputSize ({max} bytes)").into(),
-                )?;
-            }
+            check_size(chunk.as_ref().len(), max)?;
             let desc = options.type_.resolve(&chunk);
             yield decode(desc.await?, chunk.as_ref())?;
         }
@@ -141,7 +151,8 @@ pub fn protobuf_length_prefix_frame_stream(input: DataStream<Vec<u8>>) -> DataSt
 
 #[derive(Default, Clone, Debug)]
 pub struct ProtobufLengthPrefixUnframeOptions {
-    /// Largest accepted message in bytes (default unlimited).
+    /// Largest accepted message in bytes (default 64MiB; `usize::MAX` for
+    /// none).
     pub max_message_size: Option<usize>,
 }
 
@@ -154,13 +165,14 @@ fn read_prefix(buf: &[u8], max: usize) -> Result<Option<(usize, usize)>> {
         length = length.saturating_add(u64::from(byte & 0x7f).saturating_mul(scale));
         if byte & 0x80 == 0 {
             let length = usize::try_from(length).unwrap_or(usize::MAX);
-            if length > max {
-                return Err(
-                    format!("Protobuf message exceeds maxMessageSize ({max} bytes)").into(),
-                );
-            }
+            check_size(length, max)?;
             let prefix = i + 1;
             return Ok((buf.len() - prefix >= length).then_some((prefix, length)));
+        }
+        // Longer than any valid varint: without a cap a run of 0x80 bytes is
+        // buffered forever as one never-ending prefix.
+        if i + 1 == MAX_PREFIX_BYTES {
+            return Err("Protobuf length prefix exceeds 10 bytes".into());
         }
         scale = scale.saturating_mul(0x80);
     }
@@ -172,7 +184,7 @@ pub fn protobuf_length_prefix_unframe_stream(
     mut input: DataStream<Vec<u8>>,
     options: ProtobufLengthPrefixUnframeOptions,
 ) -> DataStream<Vec<u8>> {
-    let max = options.max_message_size.unwrap_or(usize::MAX);
+    let max = options.max_message_size.unwrap_or(DEFAULT_MAX_MESSAGE_SIZE);
     Box::pin(try_stream! {
         let mut pending = Vec::new();
         while let Some(chunk) = input.next().await {
@@ -307,7 +319,7 @@ mod tests {
         let encoded = encode_all(messages()).await;
         let options = ProtobufDecodeOptions {
             type_: msg_type().into(),
-            max_output_size: None,
+            max_message_size: None,
         };
         let stream = protobuf_decode_stream(create_readable_stream(encoded), options);
         assert_eq!(stream_to_array(stream, None).await.unwrap(), messages());
@@ -341,43 +353,76 @@ mod tests {
                 let desc = msg_type();
                 async move { Ok::<_, Error>(desc) }
             }),
-            max_output_size: None,
+            max_message_size: None,
         };
         let stream = protobuf_decode_stream(create_readable_stream(wrapped), options);
         assert_eq!(stream_to_array(stream, None).await.unwrap(), messages());
     }
 
+    async fn decode_with(
+        input: Vec<Vec<u8>>,
+        max_message_size: Option<usize>,
+    ) -> Result<Vec<Value>> {
+        let options = ProtobufDecodeOptions {
+            type_: msg_type().into(),
+            max_message_size,
+        };
+        let stream = protobuf_decode_stream(create_readable_stream(input), options);
+        stream_to_array(stream, None).await
+    }
+
     #[tokio::test]
-    async fn decode_max_output_size() {
+    async fn decode_max_message_size_is_per_message_not_cumulative() {
         let encoded = encode_all(messages()).await;
-        let exact: usize = encoded.iter().map(Vec::len).sum();
-        for (max, ok) in [(1024, true), (exact, true), (exact - 1, false), (1, false)] {
-            let options = ProtobufDecodeOptions {
-                type_: msg_type().into(),
-                max_output_size: Some(max),
-            };
-            let stream = protobuf_decode_stream(create_readable_stream(encoded.clone()), options);
-            match stream_to_array(stream, None).await {
-                Ok(decoded) => {
-                    assert!(ok);
-                    assert_eq!(decoded, messages());
-                }
-                Err(e) => {
-                    assert!(!ok);
-                    assert_eq!(
-                        e.to_string(),
-                        format!("Protobuf decode input exceeds maxOutputSize ({max} bytes)")
-                    );
-                }
-            }
-        }
+        // Each message fits the limit, even though together they exceed it: a
+        // long-lived consumer must not be killed by total volume.
+        let largest = encoded.iter().map(Vec::len).max().unwrap();
+        let total: usize = encoded.iter().map(Vec::len).sum();
+        assert!(total > largest);
+        assert_eq!(
+            decode_with(encoded, Some(largest)).await.unwrap(),
+            messages()
+        );
+    }
+
+    #[tokio::test]
+    async fn decode_rejects_a_message_over_max_message_size() {
+        let encoded = encode_all(vec![messages()[0].clone(), big_message()]).await;
+        let limit = encoded[1].len() - 1;
+        let e = decode_with(encoded, Some(limit)).await.unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            format!("Protobuf message exceeds maxMessageSize ({limit} bytes)")
+        );
+    }
+
+    #[tokio::test]
+    async fn decode_rejects_a_message_over_the_64mib_default_max_message_size() {
+        let limit = DEFAULT_MAX_MESSAGE_SIZE;
+        assert_eq!(limit, 67_108_864);
+        // At the limit the size check passes and decoding proceeds (all-zero
+        // bytes are not a valid message).
+        let e = decode_with(vec![vec![0; limit]], None).await.unwrap_err();
+        assert!(!e.to_string().contains("maxMessageSize"));
+        let e = decode_with(vec![vec![0; limit + 1]], None)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "Protobuf message exceeds maxMessageSize (67108864 bytes)"
+        );
+        // usize::MAX imposes no ceiling.
+        let e = decode_with(vec![vec![0; limit + 1]], Some(usize::MAX))
+            .await
+            .unwrap_err();
+        assert!(!e.to_string().contains("maxMessageSize"));
     }
 
     #[tokio::test]
     async fn decode_rejects_malformed_bytes() {
         let options = ProtobufDecodeOptions {
             type_: msg_type().into(),
-            max_output_size: None,
+            max_message_size: None,
         };
         let stream = protobuf_decode_stream(create_readable_stream([vec![0xff, 0xff]]), options);
         assert!(stream_to_array(stream, None).await.is_err());
@@ -463,5 +508,73 @@ mod tests {
         );
         // An incomplete prefix too.
         assert!(unframe_all(vec![vec![0x80]], None).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn unframe_rejects_a_length_prefix_longer_than_10_bytes() {
+        // Without a cap, a run of 0x80 is buffered forever as one prefix and
+        // every following message is silently lost.
+        let mut overlong = vec![0x80u8; 200];
+        overlong[199] = 0x01;
+        let e = unframe_all(vec![overlong, vec![2, 0xaa, 0xbb]], Some(1024))
+            .await
+            .unwrap_err();
+        assert_eq!(e.to_string(), "Protobuf length prefix exceeds 10 bytes");
+    }
+
+    #[tokio::test]
+    async fn unframe_accepts_a_10_byte_length_prefix_but_not_11() {
+        let prefix = |size: usize| {
+            let mut bytes = vec![0x80u8; size];
+            bytes[size - 1] = 0x00;
+            bytes
+        };
+        assert_eq!(
+            unframe_all(vec![prefix(10)], None).await.unwrap(),
+            [Vec::<u8>::new()]
+        );
+        let e = unframe_all(vec![prefix(11)], None).await.unwrap_err();
+        assert_eq!(e.to_string(), "Protobuf length prefix exceeds 10 bytes");
+    }
+
+    // A bare length prefix (no body) is enough: the limit is checked against
+    // the declared length before any body bytes are buffered.
+    fn varint(mut n: u64) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        while n > 0x7f {
+            bytes.push((n as u8 & 0x7f) | 0x80);
+            n >>= 7;
+        }
+        bytes.push(n as u8);
+        bytes
+    }
+
+    const INCOMPLETE: &str = "Protobuf unframe stream ended with an incomplete message";
+
+    #[tokio::test]
+    async fn unframe_rejects_a_frame_over_the_64mib_default_max_message_size() {
+        let e = unframe_all(vec![varint(67_108_865)], None)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "Protobuf message exceeds maxMessageSize (67108864 bytes)"
+        );
+    }
+
+    #[tokio::test]
+    async fn unframe_accepts_a_frame_exactly_at_the_64mib_default_max_message_size() {
+        let e = unframe_all(vec![varint(67_108_864)], None)
+            .await
+            .unwrap_err();
+        assert_eq!(e.to_string(), INCOMPLETE);
+    }
+
+    #[tokio::test]
+    async fn unframe_usize_max_disables_the_limit() {
+        let e = unframe_all(vec![varint(1 << 40)], Some(usize::MAX))
+            .await
+            .unwrap_err();
+        assert_eq!(e.to_string(), INCOMPLETE);
     }
 }

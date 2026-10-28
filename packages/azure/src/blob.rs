@@ -4,8 +4,10 @@
 
 use async_stream::try_stream;
 use azure_core::http::RequestContent;
-use azure_storage_blob::models::{BlobClientDownloadOptions, BlockLookupList};
-use azure_storage_blob::{BlobClient, BlockBlobClient};
+use azure_storage_blob::models::{
+    BlobClientDownloadOptions, BlobContainerClientListBlobsOptions, BlobItem, BlockLookupList,
+};
+use azure_storage_blob::{BlobClient, BlobContainerClient, BlockBlobClient};
 use datastream_core::{CancellationToken, DataStream, Result, StreamExt};
 
 use crate::client::send;
@@ -21,6 +23,21 @@ pub async fn azure_blob_download_stream(
     Ok(Box::pin(try_stream! {
         while let Some(bytes) = send(async { body.next().await.transpose() }, signal.as_ref()).await? {
             yield bytes.to_vec();
+        }
+    }))
+}
+
+/// Stream every blob in a container (flat listing, `prefix` etc. in `options`),
+/// following continuation markers page by page.
+pub fn azure_blob_list_stream(
+    client: &BlobContainerClient,
+    options: Option<BlobContainerClientListBlobsOptions<'static>>,
+    signal: Option<CancellationToken>,
+) -> Result<DataStream<BlobItem>> {
+    let mut items = client.list_blobs(options)?;
+    Ok(Box::pin(try_stream! {
+        while let Some(item) = send(async { items.next().await.transpose() }, signal.as_ref()).await? {
+            yield item;
         }
     }))
 }
@@ -90,7 +107,9 @@ mod tests {
     use super::*;
     use crate::client::mock::MockHttpClient;
     use azure_core::http::Url;
-    use azure_storage_blob::{BlobClientOptions, BlockBlobClientOptions};
+    use azure_storage_blob::{
+        BlobClientOptions, BlobContainerClientOptions, BlockBlobClientOptions,
+    };
     use datastream_core::{create_readable_stream, stream_to_array};
 
     const URL: &str = "https://account.blob.core.windows.net/container/blob";
@@ -129,6 +148,79 @@ mod tests {
         assert!(azure_blob_download_stream(&client, None, None)
             .await
             .is_err());
+    }
+
+    fn container_client(mock: &std::sync::Arc<MockHttpClient>) -> BlobContainerClient {
+        let options = BlobContainerClientOptions {
+            client_options: mock.client_options(),
+            ..Default::default()
+        };
+        let url = Url::parse("https://account.blob.core.windows.net/container").unwrap();
+        BlobContainerClient::new(url, None, Some(options)).unwrap()
+    }
+
+    fn list_page(names: &[&str], next_marker: &str) -> String {
+        let blobs: String = names
+            .iter()
+            .map(|name| format!("<Blob><Name>{name}</Name><Properties></Properties></Blob>"))
+            .collect();
+        format!(
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?><EnumerationResults ContainerName=\"container\">\
+             <Blobs>{blobs}</Blobs><NextMarker>{next_marker}</NextMarker></EnumerationResults>"
+        )
+    }
+
+    #[tokio::test]
+    async fn list_stream_yields_every_blob_across_pages() {
+        let mock = MockHttpClient::new(&[
+            (200, &list_page(&["a/1", "a/2"], "m2")),
+            (200, &list_page(&["a/3"], "")),
+        ]);
+        let options = BlobContainerClientListBlobsOptions {
+            prefix: Some("a/".into()),
+            ..Default::default()
+        };
+        let stream = azure_blob_list_stream(&container_client(&mock), Some(options), None).unwrap();
+        let items = stream_to_array(stream, None).await.unwrap();
+        let names: Vec<_> = items.iter().map(|b| b.name.clone().unwrap()).collect();
+        assert_eq!(names, ["a/1", "a/2", "a/3"]);
+        let requests = mock.requests();
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests[0].contains("comp=list") && requests[0].contains("prefix=a%2F"),
+            "{requests:?}"
+        );
+        assert!(requests[1].contains("marker=m2"), "{requests:?}");
+    }
+
+    // Dropping the stream early stops paging.
+    #[tokio::test]
+    async fn list_stream_is_lazy() {
+        let mock = MockHttpClient::new(&[(200, &list_page(&["a", "b"], "m2"))]);
+        let mut stream = azure_blob_list_stream(&container_client(&mock), None, None).unwrap();
+        assert_eq!(mock.requests().len(), 0);
+        let first = stream.next().await.unwrap().unwrap();
+        assert_eq!(first.name.as_deref(), Some("a"));
+        drop(stream);
+        assert_eq!(mock.requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn list_stream_aborts_on_signal() {
+        let signal = CancellationToken::new();
+        signal.cancel();
+        let mock = MockHttpClient::new(&[]);
+        let stream = azure_blob_list_stream(&container_client(&mock), None, Some(signal)).unwrap();
+        let e = stream_to_array(stream, None).await.unwrap_err();
+        assert_eq!(e.to_string(), "Aborted");
+        assert_eq!(mock.requests().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn list_stream_surfaces_errors() {
+        let mock = MockHttpClient::new(&[(403, "")]);
+        let stream = azure_blob_list_stream(&container_client(&mock), None, None).unwrap();
+        assert!(stream_to_array(stream, None).await.is_err());
     }
 
     #[tokio::test]

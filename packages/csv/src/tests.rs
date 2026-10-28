@@ -169,11 +169,11 @@ async fn parse_stream_cases() {
             json!([["he\"llo", "world"]]),
         ),
         (text("a,\"b\""), none(), json!([["a", "b"]])),
-        (text("\"a\"x,b\r\n"), none(), json!([["a", "x", "b"]])),
+        (text("\"a\"x,b\r\n"), none(), json!([["ax", "b"]])),
         (
             text("\"a\"x,b\r\n"),
             chars(None, None, Some("\\")),
-            json!([["a", "x", "b"]]),
+            json!([["ax", "b"]]),
         ),
         (text("\"he\"\"llo"), none(), json!([["he\"llo"]])),
         (
@@ -368,12 +368,12 @@ async fn parse_stream_cases() {
         (
             text("\"a\"##b"),
             chars(None, Some("###"), None),
-            json!([["a", "##b"]]),
+            json!([["a##b"]]),
         ),
         (
             text("\"a\"##b"),
             chars(None, Some("###"), Some("\\")),
-            json!([["a", "##b"]]),
+            json!([["a##b"]]),
         ),
         (
             chunks(&["\"hel", "lo\",x\r\n"]),
@@ -474,7 +474,7 @@ async fn parse_stream_errors_result() {
     assert_eq!(result.get()["UnterminatedQuote"]["idx"], json!([0]));
     assert_eq!(
         output["csvErrors"]["UnterminatedQuote"],
-        json!({"id": "UnterminatedQuote", "message": "Unterminated quoted field", "idx": [0]})
+        json!({"id": "UnterminatedQuote", "message": "Unterminated quoted field", "idx": [0], "count": 1})
     );
 
     let errors = parse_errors(text("1,2\r\n3,4\r\n"), Default::default()).await;
@@ -516,16 +516,16 @@ async fn parse_stream_unterminated_quote_idx() {
 }
 
 #[tokio::test]
-async fn parse_stream_field_max_size() {
+async fn parse_stream_max_field_size() {
     let options = |escape: Option<&str>| CsvParseOptions {
-        field_max_size: Some(10),
+        max_field_size: Some(10),
         ..chars(None, None, escape)
     };
     let over = format!("\"{}\",y\r\n", "x".repeat(11));
     for escape in [None, Some("\\")] {
         assert_eq!(
             parse_error(text(&over), options(escape)).await,
-            "CSV field size (11) exceeds fieldMaxSize (10 bytes)"
+            "CSV field size (11) exceeds maxFieldSize (10 bytes)"
         );
     }
     let exact = "x".repeat(10);
@@ -541,7 +541,7 @@ async fn parse_stream_field_max_size() {
 #[tokio::test]
 async fn parse_stream_buffer_safety_limit() {
     let options = |max| CsvParseOptions {
-        field_max_size: Some(max),
+        max_field_size: Some(max),
         ..Default::default()
     };
     let big = format!("\"{}", "x".repeat(60));
@@ -549,9 +549,21 @@ async fn parse_stream_buffer_safety_limit() {
         parse_error(text(&big), options(10)).await,
         "CSV buffer size (61) exceeds safety limit, likely unterminated quoted field"
     );
-    // Exactly twice the limit is accepted.
-    let exact = "x".repeat(16);
-    assert_eq!(parse(text(&exact), options(8)).await, json!([[exact]]));
+    // Only the incomplete row counts: exactly twice the limit is accepted,
+    // one past it is not (every field stays within max_field_size).
+    let exact = format!("{},{}", "x".repeat(7), "y".repeat(8));
+    assert_eq!(
+        parse(text(&exact), options(8)).await,
+        json!([["x".repeat(7), "y".repeat(8)]])
+    );
+    let over = format!("{},{}", "x".repeat(8), "y".repeat(8));
+    assert_eq!(
+        parse_error(text(&over), options(8)).await,
+        "CSV buffer size (17) exceeds safety limit, likely unterminated quoted field"
+    );
+    // A chunk of many small rows larger than twice the limit is accepted.
+    let rows = parse(text(&"ab,cd\r\n".repeat(10)), options(8)).await;
+    assert_eq!(rows, json!(vec![["ab", "cd"]; 10]));
 }
 
 #[tokio::test]
@@ -627,6 +639,15 @@ async fn parse_stream_collects_parser_errors_while_streaming_and_flushing() {
 }
 
 #[tokio::test]
+async fn parse_stream_quoted_last_field_with_custom_escape() {
+    let (stream, result) =
+        csv_parse_stream(text("a,\"b\"\nc,d\n"), chars(None, Some("\n"), Some("\\")));
+    assert_eq!(collect(stream).await, json!([["a", "b"], ["c", "d"]]));
+    // The closing quote is followed by the newline, not unexpected text.
+    assert_eq!(result.get(), json!({}));
+}
+
+#[tokio::test]
 async fn parse_stream_round_trips_custom_escape() {
     let value = "a\"b\\c";
     let format = CsvFormatOptions {
@@ -684,7 +705,7 @@ fn quoted_parser_rows() {
             json!([["a"], ["b"]]),
         ),
         ("\"a\"~|~\"b\"~|~", nl("~|~"), true, json!([["a"], ["b"]])),
-        ("\"a\"\r", nl("\r\n"), true, json!([["a", "\r"]])),
+        ("\"a\"\r", nl("\r\n"), true, json!([["a\r"]])),
         (
             "\"a\"\r",
             ParserOptions {
@@ -692,10 +713,11 @@ fn quoted_parser_rows() {
                 ..nl("\r\n")
             },
             true,
-            json!([["a", "\r"]]),
+            json!([["a\r"]]),
         ),
-        ("\"a\"x,b\r\n", d(), false, json!([["a", "x", "b"]])),
-        ("\"a\"x,b\r\n", esc(), false, json!([["a", "x", "b"]])),
+        // Text after a closing quote stays in the same field.
+        ("\"a\"x,b\r\n", d(), false, json!([["ax", "b"]])),
+        ("\"a\"x,b\r\n", esc(), false, json!([["ax", "b"]])),
         ("a,\"b\"", d(), true, json!([["a", "b"]])),
         ("a,\"b\"", esc(), true, json!([["a", "b"]])),
         ("\"a\",", d(), true, json!([["a", ""]])),
@@ -748,12 +770,12 @@ fn quoted_parser_lone_cr_is_garbage_not_newline() {
             ..nl("\r\n")
         };
         let result = quoted("\"a\"\rb,c\r\n", options, true);
-        assert_eq!(result.rows.len(), 1);
-        assert_eq!(result.rows[0][0], "a");
+        assert_eq!(result.rows, [["a\rb", "c"]]);
+        assert_eq!(result.errors["UnexpectedQuote"].idx, [0]);
     }
     let result = quoted("\"a\"~|x~|~", nl("~|~"), true);
-    assert_eq!(result.rows.len(), 1);
-    assert_eq!(result.rows[0][0], "a");
+    assert_eq!(result.rows, [["a~|x"]]);
+    assert_eq!(result.errors["UnexpectedQuote"].idx, [0]);
 }
 
 #[test]
@@ -849,15 +871,15 @@ fn quoted_parser_surplus_and_short_rows() {
 }
 
 #[test]
-fn quoted_parser_field_max_size() {
+fn quoted_parser_max_field_size() {
     let options = ParserOptions {
-        field_max_size: 3,
+        max_field_size: 3,
         ..Default::default()
     };
     let e = csv_quoted_parser("\"abcd\"", &options, true).unwrap_err();
     assert_eq!(
         e.to_string(),
-        "CSV field size (4) exceeds fieldMaxSize (3 bytes)"
+        "CSV field size (4) exceeds maxFieldSize (3 bytes)"
     );
     assert!(csv_quoted_parser("\"abc\"", &options, true).is_ok());
 }
@@ -950,13 +972,19 @@ async fn detect_delimiters_cases() {
         ("'a',b\n1,2\n", ",", "\n", "'"),
         ("a,'b'\n1,2\n", ",", "\n", "'"),
         ("'a',b\r\n1,2\r\n", ",", "\r\n", "'"),
-        ("a,b\n'c',d\n", ",", "\n", "'"),
+        // Only the header line counts: a quote bracketing a later field doesn't.
+        ("a,b\n'c',d\n", ",", "\n", "\""),
+        ("a,'b'\nc,d\n", ",", "\n", "'"),
+        ("a,'b'\r\n1,2\r\n", ",", "\r\n", "'"),
+        // Not at a field start / not closing at a field end.
+        ("a'b',c\n1,2\n", ",", "\n", "\""),
+        ("''a,b\n1,2\n", ",", "\n", "\""),
         ("name,note\n'x,it's fine\nhello,world\n", ",", "\n", "\""),
         ("a\tb,c\n1\t2,3\n", "\t", "\n", "\""),
         ("a|b;c,d\n1|2;3,4\n", "|", "\n", "\""),
         ("a;b,c\n1;2,3\n", ";", "\n", "\""),
-        ("x,y\nz,'w'", ",", "\n", "'"),
-        ("a,b\r'c',d\r", ",", "\r", "'"),
+        ("x,y\nz,'w'", ",", "\n", "\""),
+        ("a,'b'\rc,d\r", ",", "\r", "'"),
         ("'a',b,c\n1,2,3\n", ",", "\n", "'"),
         ("'a'\r'b'\r", ",", "\r", "'"),
         ("ab'cd,ef\r\n", ",", "\r\n", "\""),
@@ -975,6 +1003,29 @@ async fn detect_delimiters_cases() {
             "{input:?}"
         );
     }
+}
+
+#[tokio::test]
+async fn detect_delimiters_independent_of_chunking() {
+    let whole = detect(text("name,note\nbob,'hi, there'\n")).await;
+    let split = detect(chunks(&["name,note\n", "bob,'hi, there'\n"])).await;
+    assert_eq!(whole["quoteChar"], json!("\""));
+    assert_eq!(whole, split);
+}
+
+#[tokio::test]
+async fn detect_delimiters_on_flush() {
+    // No newline: the whole text is the header line, newline stays unknown.
+    assert_eq!(
+        detect(text("x,'y'")).await,
+        json!({"delimiterChar": ",", "newlineChar": null, "quoteChar": "'", "escapeChar": "'"})
+    );
+    // A CR at the end of a chunk waits for a possible LF ...
+    let value = detect(chunks(&["a,b\r", "\n1,2\r\n"])).await;
+    assert_eq!(value["newlineChar"], json!("\r\n"));
+    // ... unless the stream ends.
+    let value = detect(chunks(&["a,b\r"])).await;
+    assert_eq!(value["newlineChar"], json!("\r"));
 }
 
 #[tokio::test]
@@ -1012,6 +1063,7 @@ async fn detect_delimiters_passes_text_through() {
 async fn detect_delimiters_result_key_and_empty_input() {
     let options = CsvDetectDelimitersOptions {
         result_key: Some("delim".into()),
+        ..Default::default()
     };
     let (stream, result) = csv_detect_delimiters_stream(text("a,b\n1,2\n"), options);
     let output = pipeline(stream, &[&result]).await.unwrap();
@@ -1352,7 +1404,11 @@ async fn format_detect_parse_round_trip_preserves_payloads() {
     let header = CsvInjectHeaderOptions {
         header: vec!["val".into()],
     };
-    let formatted = csv_format_stream(csv_inject_header_stream(rows, header), Default::default());
+    let no_formulae = CsvFormatOptions {
+        escape_formulae: Some(false),
+        ..Default::default()
+    };
+    let formatted = csv_format_stream(csv_inject_header_stream(rows, header), no_formulae);
     let formatted = stream_to_string(formatted, None).await.unwrap();
 
     let (detect, d) = csv_detect_delimiters_stream(text(&formatted), Default::default());
@@ -1383,7 +1439,7 @@ async fn remove_malformed_rows() {
     assert_eq!(result.key(), "csvRemoveMalformedRows");
     assert_eq!(
         result.get(),
-        json!({"MalformedRow": {"id": "MalformedRow", "message": "Row has incorrect number of fields", "idx": [1, 3]}})
+        json!({"MalformedRow": {"id": "MalformedRow", "message": "Row has incorrect number of fields", "idx": [1, 3], "count": 2}})
     );
 
     let options = CsvRemoveMalformedRowsOptions {
@@ -1479,9 +1535,10 @@ async fn remove_empty_rows() {
     for (input, expected, idx) in cases {
         let (stream, result) = csv_remove_empty_rows_stream(values(input), Default::default());
         assert_eq!(collect(stream).await, expected);
+        let count = idx.as_array().unwrap().len();
         assert_eq!(
             result.get()["EmptyRow"],
-            json!({"id": "EmptyRow", "message": "Row is empty", "idx": idx})
+            json!({"id": "EmptyRow", "message": "Row is empty", "idx": idx, "count": count})
         );
     }
 
@@ -1515,9 +1572,8 @@ async fn remove_empty_rows() {
 async fn coerce(row: Value, columns: &[(&str, CsvCoerceType)]) -> Value {
     let options = CsvCoerceValuesOptions {
         columns: columns.iter().map(|(k, t)| (k.to_string(), *t)).collect(),
-        ..Default::default()
     };
-    let (stream, _) = csv_coerce_values_stream(values(json!([row])), options);
+    let stream = csv_coerce_values_stream(values(json!([row])), options);
     collect(stream).await[0].clone()
 }
 
@@ -1770,19 +1826,11 @@ async fn coerce_explicit_types() {
 }
 
 #[tokio::test]
-async fn coerce_result_key() {
-    let (stream, result) =
-        csv_coerce_values_stream(values(json!([{"a": "1"}])), Default::default());
-    let output = pipeline(stream, &[&result]).await.unwrap();
-    assert_eq!(Value::Object(output), json!({"csvCoerceValues": {}}));
-
-    let options = CsvCoerceValuesOptions {
-        result_key: Some("coerce".into()),
-        ..Default::default()
-    };
-    let (stream, result) = csv_coerce_values_stream(values(json!([{"a": "1"}])), options);
-    let output = pipeline(stream, &[&result]).await.unwrap();
-    assert_eq!(Value::Object(output), json!({"coerce": {}}));
+async fn coerce_adds_no_result() {
+    // csvCoerceValuesStream no longer adds a result entry.
+    let stream = csv_coerce_values_stream(values(json!([{"a": "1"}])), Default::default());
+    let output = pipeline(stream, &[]).await.unwrap();
+    assert_eq!(Value::Object(output), json!({}));
 }
 
 // *** csvInjectHeaderStream *** //
@@ -1821,6 +1869,10 @@ fn delimiter(d: &str) -> CsvFormatOptions {
 #[tokio::test]
 async fn format_cases() {
     let d = CsvFormatOptions::default;
+    let no_formulae = || CsvFormatOptions {
+        escape_formulae: Some(false),
+        ..Default::default()
+    };
     let escape = || CsvFormatOptions {
         escape_char: Some("\\".into()),
         ..Default::default()
@@ -1830,7 +1882,8 @@ async fn format_cases() {
         (json!([["say \"hi\"", "plain"]]), d(), "\"say \"\"hi\"\"\",plain\r\n"),
         (json!([["line1\nline2", "plain"]]), d(), "\"line1\nline2\",plain\r\n"),
         (json!([["1", "2"]]), d(), "1,2\r\n"),
-        (json!([["=1+2", "safe"], ["+1", "safe"], ["-1", "safe"], ["@SUM(1)", "safe"]]), d(), "\"=1+2\",safe\r\n\"+1\",safe\r\n\"-1\",safe\r\n\"@SUM(1)\",safe\r\n"),
+        (json!([["=1+2", "safe"], ["+1", "safe"], ["-1", "safe"], ["@SUM(1)", "safe"]]), d(), "'=1+2,safe\r\n\"+1\",safe\r\n\"-1\",safe\r\n'@SUM(1),safe\r\n"),
+        (json!([["=1+2", "+1", "-1", "@SUM(1)", "\tcmd", "\rcmd"]]), no_formulae(), "\"=1+2\",\"+1\",\"-1\",\"@SUM(1)\",\tcmd,\"\rcmd\"\r\n"),
         (json!([[" lead", "ok"]]), d(), "\" lead\",ok\r\n"),
         (json!([["trail ", "ok"]]), d(), "\"trail \",ok\r\n"),
         (json!([["\u{feff}bom", "ok"]]), d(), "\"\u{feff}bom\",ok\r\n"),
@@ -1847,7 +1900,7 @@ async fn format_cases() {
         (json!([["trail ", "ok"]]), delimiter("::"), "\"trail \"::ok\r\n"),
         (json!([["a\nb", "ok"]]), delimiter("::"), "\"a\nb\"::ok\r\n"),
         (json!([["a\rb", "ok"]]), delimiter("::"), "\"a\rb\"::ok\r\n"),
-        (json!([["=x", "ok"], ["+x", "ok"], ["-x", "ok"], ["@x", "ok"], [" x", "ok"], ["\u{feff}x", "ok"]]), delimiter("::"), "\"=x\"::ok\r\n\"+x\"::ok\r\n\"-x\"::ok\r\n\"@x\"::ok\r\n\" x\"::ok\r\n\"\u{feff}x\"::ok\r\n"),
+        (json!([["=x", "ok"], ["+x", "ok"], ["-x", "ok"], ["@x", "ok"], [" x", "ok"], ["\u{feff}x", "ok"]]), CsvFormatOptions { escape_formulae: Some(false), ..delimiter("::") }, "\"=x\"::ok\r\n\"+x\"::ok\r\n\"-x\"::ok\r\n\"@x\"::ok\r\n\" x\"::ok\r\n\"\u{feff}x\"::ok\r\n"),
         (json!([["a", "b", "c"]]), delimiter("::"), "a::b::c\r\n"),
         (json!([["a\"b\\c", "ok"]]), escape(), "\"a\\\"b\\\\c\",ok\r\n"),
         (json!([["a\\b,c", "ok"]]), escape(), "\"a\\\\b,c\",ok\r\n"),
@@ -1864,6 +1917,8 @@ async fn format_cases() {
         (json!([["", "a,b"]]), d(), ",\"a,b\"\r\n"),
         (json!([["1", "2"], ["3", "4"]]), CsvFormatOptions { newline_char: Some("\n".into()), ..d() }, "1,2\n3,4\n"),
         (json!([["a,b", "ok"]]), CsvFormatOptions { quote_char: Some("'".into()), ..d() }, "'a,b',ok\r\n"),
+        // A value containing a custom newline is quoted.
+        (json!([["a|b", "c"]]), CsvFormatOptions { newline_char: Some("|".into()), ..d() }, "\"a|b\",c|"),
     ];
     for (input, options, expected) in cases {
         assert_eq!(format(input.clone(), options).await, expected, "{input}");
@@ -1908,7 +1963,7 @@ async fn format_from_objects() {
         let input = values(
             json!([{"a": "1", "b": "2", "c": "3", "d": "4"}, {"a": "1", "b": "2", "c": "3", "d": "4"}]),
         );
-        let rows = csv_object_to_array(
+        let rows = csv_object_to_array_stream(
             input,
             CsvHeadersOptions {
                 headers: headers.clone().into(),
@@ -1929,14 +1984,14 @@ async fn array_to_object() {
     let options = |headers: Vec<&str>| CsvHeadersOptions {
         headers: headers.into(),
     };
-    let output = collect(csv_array_to_object(
+    let output = collect(csv_array_to_object_stream(
         values(json!([["1", "2", "3"]])),
         options(vec!["a", "b", "c"]),
     ))
     .await;
     assert_eq!(output, json!([{"a": "1", "b": "2", "c": "3"}]));
     // Reserved JS names are ordinary keys; missing columns are null.
-    let output = collect(csv_array_to_object(
+    let output = collect(csv_array_to_object_stream(
         values(json!([["v1"]])),
         options(vec!["__proto__", "constructor"]),
     ))
@@ -1946,7 +2001,7 @@ async fn array_to_object() {
     assert_eq!(keys, ["__proto__", "constructor"]);
 
     let headers = Keys::lazy(|| vec!["x".into()]);
-    let output = collect(csv_array_to_object(
+    let output = collect(csv_array_to_object_stream(
         values(json!([["1"], ["2"]])),
         CsvHeadersOptions { headers },
     ))
@@ -1959,7 +2014,7 @@ async fn object_to_array() {
     let options = CsvHeadersOptions {
         headers: vec!["a", "b", "c"].into(),
     };
-    let output = collect(csv_object_to_array(
+    let output = collect(csv_object_to_array_stream(
         values(json!([{"a": "1", "b": "2", "c": "3"}])),
         options,
     ))
@@ -1995,4 +2050,345 @@ fn unescape_custom_handles_escapes() {
     assert_eq!(unescape_custom("a\\", "\\"), "a\\");
     assert_eq!(unescape_custom("plain", "\\"), "plain");
     assert_eq!(unescape_custom("\\é", "\\"), "é");
+}
+
+// *** parity: UnexpectedQuote, maxErrorRows, BOM, limits *** //
+
+#[tokio::test]
+async fn parse_stream_keeps_text_after_closing_quote_and_records_error() {
+    let (stream, result) = csv_parse_stream(
+        text("\"a\"x,b\r\n1,2\r\n\"c\"y\r\n"),
+        CsvParseOptions::default(),
+    );
+    assert_eq!(
+        collect(stream).await,
+        json!([["ax", "b"], ["1", "2"], ["cy"]])
+    );
+    assert_eq!(
+        result.get(),
+        json!({"UnexpectedQuote": {
+            "id": "UnexpectedQuote",
+            "message": "Unexpected text after closing quote",
+            "idx": [0, 2],
+            "count": 2
+        }})
+    );
+    // A row spanning chunks is recorded once, when it is emitted.
+    let (stream, result) = csv_parse_stream(
+        chunks(&["\"a\"x,", "b\r\n", "\"c\"\r\n"]),
+        CsvParseOptions::default(),
+    );
+    assert_eq!(collect(stream).await, json!([["ax", "b"], ["c"]]));
+    assert_eq!(result.get()["UnexpectedQuote"]["idx"], json!([0]));
+    assert_eq!(result.get()["UnexpectedQuote"]["count"], json!(1));
+    // With a custom escape, a quote right after a closing quote is literal.
+    let (stream, result) = csv_parse_stream(
+        text("\"a\"\"b\",c\r\n\"d\",e\r\n"),
+        chars(None, None, Some("\\")),
+    );
+    assert_eq!(collect(stream).await, json!([["a\"b\"", "c"], ["d", "e"]]));
+    assert_eq!(result.get()["UnexpectedQuote"]["idx"], json!([0]));
+}
+
+#[tokio::test]
+async fn parse_stream_max_error_rows() {
+    let max = |n| CsvParseOptions {
+        max_error_rows: Some(n),
+        ..Default::default()
+    };
+    // The first chunk alone holds more errors than the cap.
+    let errors = parse_errors(
+        chunks(&[
+            "\"a\"x\r\n\"b\"x\r\n\"c\"x\r\n",
+            "\"d\"x\r\n1\r\n\"e\"x\r\n",
+        ]),
+        max(2),
+    )
+    .await;
+    assert_eq!(
+        errors,
+        json!({"UnexpectedQuote": {
+            "id": "UnexpectedQuote",
+            "message": "Unexpected text after closing quote",
+            "idx": [0, 1],
+            "count": 5
+        }})
+    );
+    // Fills the cap across chunks.
+    let errors = parse_errors(
+        chunks(&["\"a\"x\r\n\"b\"x\r\n", "\"c\"x\r\n\"d\"x\r\n"]),
+        max(3),
+    )
+    .await;
+    assert_eq!(errors["UnexpectedQuote"]["idx"], json!([0, 1, 2]));
+    assert_eq!(errors["UnexpectedQuote"]["count"], json!(4));
+    // Default 1000; usize::MAX keeps every row.
+    let input = "\"a\"x\r\n".repeat(1_002);
+    let errors = parse_errors(text(&input), CsvParseOptions::default()).await;
+    assert_eq!(
+        errors["UnexpectedQuote"]["idx"],
+        json!((0..1_000).collect::<Vec<_>>())
+    );
+    assert_eq!(errors["UnexpectedQuote"]["count"], json!(1_002));
+    let errors = parse_errors(text(&input), max(usize::MAX)).await;
+    assert_eq!(
+        errors["UnexpectedQuote"]["idx"],
+        json!((0..1_002).collect::<Vec<_>>())
+    );
+}
+
+#[tokio::test]
+async fn parse_stream_strips_leading_bom_once() {
+    assert_eq!(
+        parse(chunks(&["\u{feff}a,b\r\n"]), CsvParseOptions::default()).await,
+        json!([["a", "b"]])
+    );
+    // An empty first chunk does not consume the check; a later BOM is data.
+    assert_eq!(
+        parse(
+            chunks(&["", "\u{feff}a,b\r\n", "\u{feff}c\r\n"]),
+            CsvParseOptions::default()
+        )
+        .await,
+        json!([["a", "b"], ["\u{feff}c"]])
+    );
+    assert_eq!(
+        parse(
+            chunks(&["\u{feff}\u{feff}a\r\n"]),
+            CsvParseOptions::default()
+        )
+        .await,
+        json!([["\u{feff}a"]])
+    );
+}
+
+#[tokio::test]
+async fn parse_stream_max_field_size_checks_unquoted_fields() {
+    let options = |max| CsvParseOptions {
+        max_field_size: Some(max),
+        ..Default::default()
+    };
+    assert_eq!(
+        parse_error(text("abcdefghijk,y\r\n"), options(10)).await,
+        "CSV field size (11) exceeds maxFieldSize (10 bytes)"
+    );
+    assert_eq!(
+        parse(text("abcdefghij,y\r\n"), options(10)).await,
+        json!([["abcdefghij", "y"]])
+    );
+    // usize::MAX disables the field and buffer limits.
+    let val = "x".repeat(64);
+    assert_eq!(
+        parse(
+            chunks(&[&format!("\"{val}"), "\",y\r\n"]),
+            options(usize::MAX)
+        )
+        .await,
+        json!([[val, "y"]])
+    );
+}
+
+#[test]
+fn quoted_parser_unexpected_quote_errors() {
+    for escape in [None, Some("\\".to_string())] {
+        let options = ParserOptions {
+            escape_char: escape,
+            ..Default::default()
+        };
+        let result = quoted("\"a\"x,b\r\n", options, false);
+        assert_eq!(result.rows, [["ax", "b"]]);
+        assert_eq!(
+            result.errors["UnexpectedQuote"],
+            CsvError {
+                id: "UnexpectedQuote".into(),
+                message: "Unexpected text after closing quote".into(),
+                idx: vec![0],
+            }
+        );
+    }
+}
+
+#[tokio::test]
+async fn detect_delimiters_max_buffer_size() {
+    let run = |input: &[&str], max: usize| {
+        let options = CsvDetectDelimitersOptions {
+            max_buffer_size: Some(max),
+            ..Default::default()
+        };
+        csv_detect_delimiters_stream(chunks(input), options)
+    };
+    let (stream, _) = run(&["abcd", "e"], 4);
+    assert_eq!(
+        stream_to_array(stream, None).await.unwrap_err().to_string(),
+        "csvDetectDelimitersStream buffer (5) exceeds maxBufferSize (4), newline not found"
+    );
+    // Exactly the limit is fine.
+    let (stream, _) = run(&["ab", "cd"], 4);
+    assert_eq!(collect_strings(stream).await, ["abcd"]);
+    // A buffer that completes the first line is not limited.
+    let (stream, result) = run(&["ab", "c;d\n"], 4);
+    assert_eq!(collect_strings(stream).await, ["abc;d\n"]);
+    assert_eq!(result.get()["delimiterChar"], ";");
+    // usize::MAX disables the limit.
+    let input = "x".repeat(64);
+    let (stream, _) = run(&[&input, ";y\n"], usize::MAX);
+    assert_eq!(collect_strings(stream).await, [format!("{input};y\n")]);
+}
+
+#[tokio::test]
+async fn detect_header_max_buffer_size() {
+    let run = |input: &[&str], max: Option<usize>| {
+        let options = CsvDetectHeaderOptions {
+            max_buffer_size: max,
+            ..Default::default()
+        };
+        csv_detect_header_stream(chunks(input), options)
+    };
+    let (stream, _) = run(&["abcd", "e"], Some(4));
+    assert_eq!(
+        stream_to_array(stream, None).await.unwrap_err().to_string(),
+        "csvDetectHeaderStream buffer (5) exceeds maxBufferSize (4), header row not found"
+    );
+    // Exactly the limit is fine.
+    let (stream, result) = run(&["a,", "bc"], Some(4));
+    assert!(collect_strings(stream).await.is_empty());
+    assert_eq!(result.get()["header"], json!(["a", "bc"]));
+    // A buffer that completes the header row is not limited.
+    let (stream, result) = run(&["a,", "bc\r\n1,2"], Some(4));
+    assert_eq!(collect_strings(stream).await, ["1,2"]);
+    assert_eq!(result.get()["header"], json!(["a", "bc"]));
+    // usize::MAX disables the limit.
+    let input = "x".repeat(64);
+    let (stream, result) = run(&[&input, ",y\r\nz"], Some(usize::MAX));
+    assert_eq!(collect_strings(stream).await, ["z"]);
+    assert_eq!(result.get()["header"], json!([input, "y"]));
+}
+
+#[tokio::test]
+async fn detect_header_retries_once_the_buffer_doubles() {
+    // Attempts at buffer lengths 1, 2, 4, 8: the header row completes at 5 but
+    // is only found at 8, so "xyz" is emitted as one chunk.
+    let input: Vec<String> = "abc\r\nxyz\r\n".chars().map(String::from).collect();
+    let (stream, result) =
+        csv_detect_header_stream(create_readable_stream(input), Default::default());
+    assert_eq!(collect_strings(stream).await, ["xyz", "\r", "\n"]);
+    assert_eq!(result.get()["header"], json!(["abc"]));
+    // The failed attempt at 6 schedules the retry at min(12, 10 + 1) = 11, so
+    // the buffer of 10 is skipped and the header is found at 11.
+    let options = CsvDetectHeaderOptions {
+        max_buffer_size: Some(10),
+        ..Default::default()
+    };
+    let (stream, result) = csv_detect_header_stream(chunks(&["abcdef", "\r\n12", "3"]), options);
+    assert_eq!(collect_strings(stream).await, ["123"]);
+    assert_eq!(result.get()["header"], json!(["abcdef"]));
+}
+
+#[tokio::test]
+async fn detect_header_text_after_closing_quote_is_literal() {
+    // With a custom escape, a quote right after a closing quote does not open
+    // another quoted field, so the newline after it ends the header row.
+    let options = CsvDetectHeaderOptions {
+        escape_char: Some("\\".into()),
+        ..Default::default()
+    };
+    let (stream, result) = csv_detect_header_stream(text("\"a\"\"x\r\ny\",z\r\n"), options);
+    assert_eq!(collect_strings(stream).await.concat(), "y\",z\r\n");
+    assert_eq!(result.get()["header"], json!(["a\"x"]));
+}
+
+#[tokio::test]
+async fn format_escapes_formulae() {
+    // A leading ' makes spreadsheets treat the cell as text; quoting alone
+    // does not. \r still forces quoting.
+    let rows = json!([
+        ["=1+2", "@SUM(1)", "+cmd", "-cmd"],
+        ["\tcmd", "\rcmd", "a=1", "'=1"]
+    ]);
+    assert_eq!(
+        format(rows, Default::default()).await,
+        "'=1+2,'@SUM(1),'+cmd,'-cmd\r\n'\tcmd,\"'\rcmd\",a=1,'=1\r\n"
+    );
+    // Signed numbers are left as-is (still quoted by the leading-sign rule).
+    let rows = json!([
+        ["+1", "-12", "-1.5", "+2e10", "-3.25E-7", -4],
+        ["-1.", "+.5", "-1e", "--1", "-1x", "-1-1"]
+    ]);
+    assert_eq!(
+        format(rows, Default::default()).await,
+        "\"+1\",\"-12\",\"-1.5\",\"+2e10\",\"-3.25E-7\",\"-4\"\r\n'-1.,'+.5,'-1e,'--1,'-1x,'-1-1\r\n"
+    );
+}
+
+#[tokio::test]
+async fn remove_rows_max_error_rows() {
+    let rows = || json!([["a", "b"], ["1"], ["2"], ["3", "4"], ["5"]]);
+    let options = CsvRemoveMalformedRowsOptions {
+        max_error_rows: Some(2),
+        ..Default::default()
+    };
+    let (stream, result) = csv_remove_malformed_rows_stream(values(rows()), options);
+    assert_eq!(collect(stream).await, json!([["a", "b"], ["3", "4"]]));
+    assert_eq!(
+        result.get(),
+        json!({"MalformedRow": {
+            "id": "MalformedRow",
+            "message": "Row has incorrect number of fields",
+            "idx": [1, 2],
+            "count": 3
+        }})
+    );
+    let many = |row: Value| {
+        let mut rows = vec![json!(["a", "b"])];
+        rows.extend(std::iter::repeat_n(row, 1_002));
+        Value::Array(rows)
+    };
+    let (stream, result) =
+        csv_remove_malformed_rows_stream(values(many(json!(["1"]))), Default::default());
+    pipeline(stream, &[]).await.unwrap();
+    assert_eq!(
+        result.get()["MalformedRow"]["idx"],
+        json!((1..=1_000).collect::<Vec<_>>())
+    );
+    assert_eq!(result.get()["MalformedRow"]["count"], json!(1_002));
+    let options = CsvRemoveMalformedRowsOptions {
+        max_error_rows: Some(usize::MAX),
+        ..Default::default()
+    };
+    let (stream, result) = csv_remove_malformed_rows_stream(values(many(json!(["1"]))), options);
+    pipeline(stream, &[]).await.unwrap();
+    assert_eq!(
+        result.get()["MalformedRow"]["idx"],
+        json!((1..=1_002).collect::<Vec<_>>())
+    );
+
+    let options = CsvRemoveEmptyRowsOptions {
+        max_error_rows: Some(2),
+        ..Default::default()
+    };
+    let (stream, result) =
+        csv_remove_empty_rows_stream(values(json!([[""], ["a"], [""], [""]])), options);
+    assert_eq!(collect(stream).await, json!([["a"]]));
+    assert_eq!(
+        result.get(),
+        json!({"EmptyRow": {"id": "EmptyRow", "message": "Row is empty", "idx": [0, 2], "count": 3}})
+    );
+    let (stream, result) =
+        csv_remove_empty_rows_stream(values(many(json!([""]))), Default::default());
+    pipeline(stream, &[]).await.unwrap();
+    assert_eq!(
+        result.get()["EmptyRow"]["idx"],
+        json!((1..=1_000).collect::<Vec<_>>())
+    );
+    assert_eq!(result.get()["EmptyRow"]["count"], json!(1_002));
+    let options = CsvRemoveEmptyRowsOptions {
+        max_error_rows: Some(usize::MAX),
+        ..Default::default()
+    };
+    let (stream, result) = csv_remove_empty_rows_stream(values(many(json!([""]))), options);
+    pipeline(stream, &[]).await.unwrap();
+    assert_eq!(
+        result.get()["EmptyRow"]["idx"].as_array().unwrap().len(),
+        1_002
+    );
 }

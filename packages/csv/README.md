@@ -12,5 +12,5 @@ CSV parsing and formatting streams, ported from `@datastream/csv`.
 - `csv_coerce_values_stream`
 - `csv_inject_header_stream`
 - `csv_format_stream`
-- `csv_array_to_object`
-- `csv_object_to_array`
+- `csv_array_to_object_stream`
+- `csv_object_to_array_stream`

@@ -9,12 +9,15 @@ use aws_sdk_dynamodb::operation::execute_statement::builders::ExecuteStatementFl
 use aws_sdk_dynamodb::operation::query::builders::QueryFluentBuilder;
 use aws_sdk_dynamodb::operation::scan::builders::ScanFluentBuilder;
 use aws_sdk_dynamodb::types::{
-    AttributeValue, DeleteRequest, KeysAndAttributes, PutRequest, WriteRequest,
+    AttributeValue, DeleteRequest, KeysAndAttributes, PutRequest, ReturnConsumedCapacity,
+    ReturnItemCollectionMetrics, WriteRequest,
 };
 use aws_sdk_dynamodb::Client;
-use datastream_core::{CancellationToken, DataStream, Error, Result, StreamExt};
+use datastream_core::{CancellationToken, DataStream, Error, Result};
 
-use crate::client::{backoff, batch_write, cause_error, send, Batcher, IntoVec, Retry};
+use crate::client::{
+    backoff, batch_write, cause_error, retries_exhausted, send, Batcher, IntoVec, Retry, Sent,
+};
 
 /// A DynamoDB item or key.
 pub type Item = HashMap<String, AttributeValue>;
@@ -23,8 +26,23 @@ pub type Item = HashMap<String, AttributeValue>;
 #[derive(Default, Clone, Debug)]
 pub struct AwsDynamoDBOptions {
     pub table_name: String,
-    /// Retries for unprocessed keys / items (default 10).
+    /// Retries for unprocessed keys / items (default 10; `u32::MAX` retries
+    /// without limit).
     pub retry_max_count: Option<u32>,
+    /// BatchGetItem `KeysAndAttributes` field, sent with the keys on every
+    /// request and retry.
+    pub consistent_read: Option<bool>,
+    /// BatchGetItem `KeysAndAttributes` field (see `consistent_read`).
+    pub projection_expression: Option<String>,
+    /// BatchGetItem `KeysAndAttributes` field (see `consistent_read`).
+    pub expression_attribute_names: Option<HashMap<String, String>>,
+    /// BatchGetItem `KeysAndAttributes` field (see `consistent_read`).
+    pub attributes_to_get: Option<Vec<String>>,
+    /// Request-level field, sent on every BatchGetItem / BatchWriteItem request
+    /// and retry.
+    pub return_consumed_capacity: Option<ReturnConsumedCapacity>,
+    /// Request-level BatchWriteItem field, sent on every request and retry.
+    pub return_item_collection_metrics: Option<ReturnItemCollectionMetrics>,
     pub signal: Option<CancellationToken>,
 }
 
@@ -77,7 +95,7 @@ pub fn aws_dynamodb_execute_statement_stream(
             for item in output.items.into_vec() {
                 yield item;
             }
-            match output.next_token {
+            match output.next_token.filter(|token| !token.is_empty()) {
                 Some(token) => request = request.next_token(token),
                 None => break,
             }
@@ -86,6 +104,8 @@ pub fn aws_dynamodb_execute_statement_stream(
 }
 
 /// Fetch `keys` (at most 100) with BatchGetItem, retrying unprocessed keys.
+/// The `KeysAndAttributes` options (`consistent_read`, projection, ...) go
+/// with the keys; `return_consumed_capacity` goes on the request.
 pub fn aws_dynamodb_get_item_stream(
     client: Client,
     keys: Vec<Item>,
@@ -106,9 +126,16 @@ pub fn aws_dynamodb_get_item_stream(
         loop {
             let request = KeysAndAttributes::builder()
                 .set_keys(Some(keys))
+                .set_consistent_read(options.consistent_read)
+                .set_projection_expression(options.projection_expression.clone())
+                .set_expression_attribute_names(options.expression_attribute_names.clone())
+                .set_attributes_to_get(options.attributes_to_get.clone())
                 .build()
                 .map_err(Error::from)?;
-            let request = client.batch_get_item().request_items(&table, request);
+            let request = client
+                .batch_get_item()
+                .set_return_consumed_capacity(options.return_consumed_capacity.clone())
+                .request_items(&table, request);
             let mut output = send(request.send(), options.signal.as_ref()).await?;
             let items = output.responses.as_mut().and_then(|r| r.remove(&table));
             for item in items.unwrap_or_default() {
@@ -119,50 +146,69 @@ pub fn aws_dynamodb_get_item_stream(
             if keys.is_empty() {
                 break;
             }
-            if retry_count >= retry_max_count {
+            if retries_exhausted(retry_count, retry_max_count) {
                 let cause = format!("TableName: {table}, UnprocessedKeysCount: {}", keys.len());
                 Err::<(), Error>(cause_error("awsDynamoDBBatchGetItem has UnprocessedKeys", cause))?;
             }
             backoff(retry_count, options.signal.as_ref()).await?;
-            retry_count += 1;
+            retry_count = retry_count.saturating_add(1);
         }
     }))
 }
 
 /// Write items with BatchWriteItem (25 per batch), retrying unprocessed items.
+/// On an input error or abort, items still buffered come back as
+/// [`AwsUnsentError<Item>`](crate::AwsUnsentError) (not sent).
 pub async fn aws_dynamodb_put_item_stream(
     client: Client,
     input: DataStream<Item>,
     options: AwsDynamoDBOptions,
 ) -> Result<()> {
-    let requests = input.map(|item| -> Result<WriteRequest> {
-        let put = PutRequest::builder().set_item(Some(item?)).build()?;
-        Ok(WriteRequest::builder().put_request(put).build())
-    });
-    batch_write_item(client, Box::pin(requests), options).await
+    let write = BatchWrite {
+        request: |item| {
+            let put = PutRequest::builder().set_item(Some(item)).build()?;
+            Ok(WriteRequest::builder().put_request(put).build())
+        },
+        item: |request| request.put_request.map(|put| put.item),
+    };
+    batch_write_item(client, input, options, write).await
 }
 
 /// Delete keys with BatchWriteItem (25 per batch), retrying unprocessed items.
+/// On an input error or abort, keys still buffered come back as
+/// [`AwsUnsentError<Item>`](crate::AwsUnsentError) (not sent).
 pub async fn aws_dynamodb_delete_item_stream(
     client: Client,
     input: DataStream<Item>,
     options: AwsDynamoDBOptions,
 ) -> Result<()> {
-    let requests = input.map(|key| -> Result<WriteRequest> {
-        let delete = DeleteRequest::builder().set_key(Some(key?)).build()?;
-        Ok(WriteRequest::builder().delete_request(delete).build())
-    });
-    batch_write_item(client, Box::pin(requests), options).await
+    let write = BatchWrite {
+        request: |key| {
+            let delete = DeleteRequest::builder().set_key(Some(key)).build()?;
+            Ok(WriteRequest::builder().delete_request(delete).build())
+        },
+        item: |request| request.delete_request.map(|delete| delete.key),
+    };
+    batch_write_item(client, input, options, write).await
+}
+
+// The buffer holds the caller's items (wrapped only when sent) so an input
+// error or abort can hand them back unsent.
+#[derive(Clone, Copy)]
+struct BatchWrite {
+    request: fn(Item) -> Result<WriteRequest>,
+    item: fn(WriteRequest) -> Option<Item>,
 }
 
 async fn batch_write_item(
     client: Client,
-    input: DataStream<WriteRequest>,
+    input: DataStream<Item>,
     options: AwsDynamoDBOptions,
+    write: BatchWrite,
 ) -> Result<()> {
     let table = options.table_name;
     let signal = options.signal.clone();
-    let batcher = Batcher::<WriteRequest> {
+    let batcher = Batcher::<Item> {
         max_entries: 25,
         max_entry_bytes: usize::MAX,
         max_batch_bytes: usize::MAX,
@@ -173,23 +219,39 @@ async fn batch_write_item(
         max_count: options.retry_max_count.unwrap_or(10),
         signal: options.signal,
         message: "awsDynamoDBBatchWriteItem has UnprocessedItems",
+        describe: |failed| failed.concat(),
     };
+    let request = client
+        .batch_write_item()
+        .set_return_consumed_capacity(options.return_consumed_capacity)
+        .set_return_item_collection_metrics(options.return_item_collection_metrics);
     batch_write(input, batcher, retry, move |batch| {
-        let request = client.batch_write_item().request_items(&table, batch);
+        let requests = batch.into_iter().map(write.request).collect::<Result<_>>();
+        let request = requests.map(|requests| request.clone().request_items(&table, requests));
         let table = table.clone();
         let signal = signal.clone();
         async move {
-            let mut output = send(request.send(), signal.as_ref()).await?;
+            let mut output = send(request?.send(), signal.as_ref()).await?;
             let unprocessed = output
                 .unprocessed_items
                 .as_mut()
-                .and_then(|u| u.remove(&table));
-            let unprocessed = unprocessed.unwrap_or_default();
-            let cause = format!(
+                .and_then(|u| u.remove(&table))
+                .unwrap_or_default();
+            if unprocessed.is_empty() {
+                return Ok(Sent::ok());
+            }
+            // Counts only: item values may be PII and must not leak into logged
+            // error causes.
+            let failed = vec![format!(
                 "TableName: {table}, UnprocessedItemsCount: {}",
                 unprocessed.len()
-            );
-            Ok::<_, Error>((unprocessed, cause))
+            )];
+            let retry = unprocessed.into_iter().filter_map(write.item).collect();
+            Ok::<_, Error>(Sent {
+                retry,
+                failed,
+                permanent: Vec::new(),
+            })
         }
     })
     .await
@@ -222,7 +284,7 @@ mod tests {
         AwsDynamoDBOptions {
             table_name: "t".to_string(),
             retry_max_count,
-            signal: None,
+            ..Default::default()
         }
     }
 
@@ -505,5 +567,216 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(e.to_string(), "Aborted");
+    }
+
+    // Request-level fields go on every BatchWriteItem request, retries
+    // included, and unprocessed items are retried as the same request kind.
+    #[tokio::test(start_paused = true)]
+    async fn write_streams_forward_request_level_options_on_retry() {
+        for delete in [false, true] {
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let seen = requests.clone();
+            let rule = mock!(Client::batch_write_item).then_compute_output(move |req| {
+                let mut requests = seen.lock().unwrap();
+                requests.push(req.clone());
+                let output = BatchWriteItemOutput::builder();
+                if requests.len() == 1 {
+                    let batch = req.request_items().unwrap()["t"].clone();
+                    output.unprocessed_items("t", batch).build()
+                } else {
+                    output.build()
+                }
+            });
+            let client = mock_client!(aws_sdk_dynamodb, RuleMode::MatchAny, [&rule]);
+            let opts = AwsDynamoDBOptions {
+                return_consumed_capacity: Some(ReturnConsumedCapacity::Total),
+                return_item_collection_metrics: Some(ReturnItemCollectionMetrics::Size),
+                ..options(Some(1))
+            };
+            let input = create_readable_stream(vec![item("a")]);
+            if delete {
+                aws_dynamodb_delete_item_stream(client, input, opts).await
+            } else {
+                aws_dynamodb_put_item_stream(client, input, opts).await
+            }
+            .unwrap();
+            let requests = requests.lock().unwrap();
+            assert_eq!(requests.len(), 2);
+            for request in requests.iter() {
+                assert_eq!(
+                    request.return_consumed_capacity(),
+                    Some(&ReturnConsumedCapacity::Total)
+                );
+                assert_eq!(
+                    request.return_item_collection_metrics(),
+                    Some(&ReturnItemCollectionMetrics::Size)
+                );
+                let write = &request.request_items().unwrap()["t"][0];
+                let key = if delete {
+                    write.delete_request().unwrap().key()
+                } else {
+                    write.put_request().unwrap().item()
+                };
+                assert_eq!(key, &item("a"));
+            }
+        }
+    }
+
+    // KeysAndAttributes fields go with the keys on the first request and on
+    // every retry.
+    #[tokio::test(start_paused = true)]
+    async fn get_item_stream_forwards_consistent_read_and_projection() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let seen = requests.clone();
+        let rule = mock!(Client::batch_get_item).then_compute_output(move |req| {
+            let mut requests = seen.lock().unwrap();
+            requests.push(req.request_items().unwrap()["t"].clone());
+            match requests.len() {
+                1 => get_output(&["1"], &["2"]),
+                _ => get_output(&["2"], &[]),
+            }
+        });
+        let client = mock_client!(aws_sdk_dynamodb, RuleMode::MatchAny, [&rule]);
+        let names = HashMap::from([("#n".to_string(), "name".to_string())]);
+        let opts = AwsDynamoDBOptions {
+            consistent_read: Some(true),
+            projection_expression: Some("#n".into()),
+            expression_attribute_names: Some(names.clone()),
+            ..options(Some(1))
+        };
+        let stream =
+            aws_dynamodb_get_item_stream(client, vec![item("1"), item("2")], opts).unwrap();
+        assert_eq!(
+            ids(&stream_to_array(stream, None).await.unwrap()),
+            ["1", "2"]
+        );
+        let requests = std::mem::take(&mut *requests.lock().unwrap());
+        assert_eq!(requests.len(), 2);
+        for (request, keys) in requests
+            .iter()
+            .zip([vec![item("1"), item("2")], vec![item("2")]])
+        {
+            assert_eq!(request.keys(), keys);
+            assert_eq!(request.consistent_read(), Some(true));
+            assert_eq!(request.projection_expression(), Some("#n"));
+            assert_eq!(request.expression_attribute_names(), Some(&names));
+            assert!(request.attributes_to_get().is_empty());
+        }
+
+        let rule = mock!(Client::batch_get_item).then_compute_output(|req| {
+            let request = &req.request_items().unwrap()["t"];
+            assert_eq!(request.attributes_to_get(), ["id"]);
+            assert_eq!(request.consistent_read(), None);
+            get_output(&["1"], &[])
+        });
+        let client = mock_client!(aws_sdk_dynamodb, RuleMode::MatchAny, [&rule]);
+        let opts = AwsDynamoDBOptions {
+            attributes_to_get: Some(vec!["id".into()]),
+            ..options(None)
+        };
+        let stream = aws_dynamodb_get_item_stream(client, vec![item("1")], opts).unwrap();
+        assert_eq!(ids(&stream_to_array(stream, None).await.unwrap()), ["1"]);
+        assert_eq!(rule.num_calls(), 1);
+    }
+
+    // 11 failures: one more than the default retry_max_count of 10.
+    #[tokio::test(start_paused = true)]
+    async fn get_and_put_item_streams_retry_without_limit_at_u32_max() {
+        let rule = mock!(Client::batch_get_item)
+            .sequence()
+            .output(|| get_output(&[], &["1"]))
+            .times(11)
+            .output(|| get_output(&["1"], &[]))
+            .build();
+        let client = mock_client!(aws_sdk_dynamodb, RuleMode::MatchAny, [&rule]);
+        let stream =
+            aws_dynamodb_get_item_stream(client, vec![item("1")], options(Some(u32::MAX))).unwrap();
+        assert_eq!(ids(&stream_to_array(stream, None).await.unwrap()), ["1"]);
+        assert_eq!(rule.num_calls(), 12);
+
+        let (client, calls) = write_client(11);
+        aws_dynamodb_put_item_stream(
+            client,
+            create_readable_stream(vec![item("1")]),
+            options(Some(u32::MAX)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(calls.lock().unwrap().len(), 12);
+    }
+
+    // An empty NextToken ends the PartiQL pagination, as an absent one does.
+    #[tokio::test]
+    async fn execute_statement_stream_stops_on_empty_next_token() {
+        let rule = mock!(Client::execute_statement).then_output(|| {
+            ExecuteStatementOutput::builder()
+                .items(item("1"))
+                .next_token("")
+                .build()
+        });
+        let client = mock_client!(aws_sdk_dynamodb, RuleMode::MatchAny, [&rule]);
+        let stream = aws_dynamodb_execute_statement_stream(client.execute_statement(), None);
+        assert_eq!(ids(&stream_to_array(stream, None).await.unwrap()), ["1"]);
+        assert_eq!(rule.num_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn get_item_stream_forwards_return_consumed_capacity() {
+        let capacities = Arc::new(Mutex::new(Vec::new()));
+        let seen = capacities.clone();
+        let rule = mock!(Client::batch_get_item).then_compute_output(move |req| {
+            seen.lock()
+                .unwrap()
+                .push(req.return_consumed_capacity().cloned());
+            get_output(&["1"], &[])
+        });
+        let client = mock_client!(aws_sdk_dynamodb, RuleMode::MatchAny, [&rule]);
+        let opts = AwsDynamoDBOptions {
+            return_consumed_capacity: Some(ReturnConsumedCapacity::Indexes),
+            ..options(None)
+        };
+        let stream = aws_dynamodb_get_item_stream(client, vec![item("1")], opts).unwrap();
+        assert_eq!(ids(&stream_to_array(stream, None).await.unwrap()), ["1"]);
+        assert_eq!(
+            *capacities.lock().unwrap(),
+            [Some(ReturnConsumedCapacity::Indexes)]
+        );
+    }
+
+    // An input error or abort hands back the items buffered since the last
+    // flush (the caller's items, not WriteRequests); nothing more is sent.
+    #[tokio::test]
+    async fn write_streams_attach_buffered_items_on_input_error_and_abort() {
+        let (client, calls) = write_client(0);
+        let input: Vec<Result<Item>> = (0..26)
+            .map(|i| Ok(item(&i.to_string())))
+            .chain([Err("boom".into())])
+            .collect();
+        let input: DataStream<Item> = Box::pin(futures::stream::iter(input));
+        let e = aws_dynamodb_put_item_stream(client, input, options(None))
+            .await
+            .unwrap_err();
+        assert_eq!(e.to_string(), "boom");
+        let unsent = e.downcast_ref::<crate::AwsUnsentError<Item>>().unwrap();
+        assert_eq!(unsent.failed_messages, [item("25")]);
+        assert_eq!(calls.lock().unwrap().len(), 1);
+
+        let (client, calls) = write_client(0);
+        let signal = CancellationToken::new();
+        let opts = AwsDynamoDBOptions {
+            signal: Some(signal.clone()),
+            ..options(None)
+        };
+        let (sender, input) = datastream_core::create_readable_channel(None);
+        let task = tokio::spawn(aws_dynamodb_delete_item_stream(client, input, opts));
+        sender.send(item("1")).await.unwrap();
+        sender.send(item("2")).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        signal.cancel();
+        let e = task.await.unwrap().unwrap_err();
+        assert_eq!(e.to_string(), "Aborted");
+        let unsent = e.downcast_ref::<crate::AwsUnsentError<Item>>().unwrap();
+        assert_eq!(unsent.failed_messages, [item("1"), item("2")]);
+        assert!(calls.lock().unwrap().is_empty());
     }
 }

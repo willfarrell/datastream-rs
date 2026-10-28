@@ -24,7 +24,8 @@ use proptest::prelude::*;
 
 // SNS PublishBatch and SQS SendMessageBatch limits.
 const MAX_ENTRIES: usize = 10;
-const MAX_BATCH_BYTES: usize = 256 * 1024;
+// SQS SendMessageBatch aggregate payload limit (1MiB).
+const MAX_BATCH_BYTES: usize = 1024 * 1024;
 
 fn runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_current_thread()
@@ -155,7 +156,7 @@ proptest! {
 
     // Batches respect both the entry count and the aggregate byte limit.
     #[test]
-    fn fuzz_aws_sqs_send_message_stream_sizes(sizes in prop::collection::vec(0..60_000usize, 0..60)) {
+    fn fuzz_aws_sqs_send_message_stream_sizes(sizes in prop::collection::vec(0..200_000usize, 0..30)) {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let seen = calls.clone();
         let rule = mock!(aws_sdk_sqs::Client::send_message_batch).then_compute_output(move |req| {
@@ -215,6 +216,7 @@ proptest! {
         prop_assert_eq!(&whole_bytes, &data);
         prop_assert_eq!(&chunked, &whole);
         let parts = whole["s3"]["checksums"].as_array().unwrap().len();
-        prop_assert_eq!(parts, data.len().div_ceil(part_size));
+        // Empty input is one part: the algorithm's empty-input digest.
+        prop_assert_eq!(parts, data.len().div_ceil(part_size).max(1));
     }
 }

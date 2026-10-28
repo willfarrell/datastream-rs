@@ -87,6 +87,7 @@ pub struct EncryptOptions {
     pub iv: Option<Vec<u8>>,
     pub aad: Option<Vec<u8>>,
     /// Defaults to 64MB for AEAD modes; CTR is unlimited unless set.
+    /// `Some(usize::MAX)` lifts the AEAD default (JS `maxInputSize: null`).
     pub max_input_size: Option<usize>,
     pub result_key: Option<String>,
 }
@@ -99,8 +100,10 @@ pub struct DecryptOptions {
     pub iv: Vec<u8>,
     pub auth_tag: Option<Vec<u8>>,
     pub aad: Option<Vec<u8>>,
-    /// AEAD only (the whole ciphertext is buffered). Defaults to 64MB.
+    /// AEAD only (the whole ciphertext is buffered). Defaults to 64MB;
+    /// `Some(usize::MAX)` lifts it (JS `maxInputSize: null`).
     pub max_input_size: Option<usize>,
+    /// Plaintext ceiling, unlimited unless set. CTR enforces it per chunk.
     pub max_output_size: Option<usize>,
 }
 
@@ -245,8 +248,9 @@ where
             size = size.saturating_add(bytes.len());
             if let Some(max) = max {
                 if size > max {
+                    // Don't steer users to unauthenticated CTR for large data.
                     Err::<(), Error>(format!(
-                        "Encryption input exceeds maxInputSize ({max} bytes). Use AES-256-CTR for large data."
+                        "Encryption input exceeds maxInputSize ({max} bytes). Raise maxInputSize or encrypt the data as separate smaller messages."
                     ).into())?;
                 }
             }
@@ -638,7 +642,7 @@ mod tests {
             assert!(encrypt(&[0; 10], 3, options.clone()).await.is_ok());
             assert_eq!(
                 err_msg(encrypt(&[0; 11], 3, options).await),
-                "Encryption input exceeds maxInputSize (10 bytes). Use AES-256-CTR for large data."
+                "Encryption input exceeds maxInputSize (10 bytes). Raise maxInputSize or encrypt the data as separate smaller messages."
             );
         }
     }
@@ -741,6 +745,117 @@ mod tests {
             err_msg(stream.next().await.unwrap()),
             "Decryption output exceeds maxOutputSize (50 bytes)"
         );
+    }
+
+    #[tokio::test]
+    async fn matches_node_crypto_edge_vectors() {
+        // node:crypto: empty plaintext still yields a tag (bound to the AAD), and
+        // AES-128-CTR wraps its full 128-bit counter like AES-256-CTR.
+        for (algorithm, aad, tag) in [
+            (
+                Algorithm::Aes256Gcm,
+                None,
+                "04c042d8f6466b76683104ed1a108a06",
+            ),
+            (
+                Algorithm::Chacha20Poly1305,
+                Some(b"meta".to_vec()),
+                "c08ae808dc6dc71701671b18db7cb260",
+            ),
+        ] {
+            let options = EncryptOptions {
+                algorithm,
+                key: vec![7; 32],
+                iv: Some(vec![9; 12]),
+                aad: aad.clone(),
+                ..Default::default()
+            };
+            let (out, value) = encrypt(&[], 1, options).await.unwrap();
+            assert!(out.is_empty());
+            assert_eq!(bytes(&value["authTag"]), hex(tag));
+            let options = DecryptOptions {
+                algorithm,
+                key: vec![7; 32],
+                iv: vec![9; 12],
+                auth_tag: Some(hex(tag)),
+                aad,
+                ..Default::default()
+            };
+            assert!(decrypt(&[], 1, options).await.unwrap().is_empty());
+        }
+
+        let options = EncryptOptions {
+            algorithm: Algorithm::Aes128Ctr,
+            key: vec![7; 16],
+            iv: Some(vec![0xff; 16]),
+            ..Default::default()
+        };
+        let (out, _) = encrypt(&[0x43; 40], 7, options).await.unwrap();
+        assert_eq!(
+            out,
+            hex("6fadb4cef6539c86ff70667ec8c05cd60fc0f20a4892e46f1004db05cb06d2ecd40dc875a2a031d0")
+        );
+    }
+
+    #[tokio::test]
+    async fn default_input_limit_and_usize_max_opt_out() {
+        // Both defaults reject while buffering, before any (slow, in debug)
+        // crypto runs over 64MB.
+        const MIB: usize = 1024 * 1024;
+        let over = DEFAULT_MAX_INPUT_SIZE + 1;
+        let big = || {
+            create_readable_stream(
+                (0..over.div_ceil(MIB))
+                    .map(|i| vec![0x41; MIB.min(over - i * MIB)])
+                    .collect::<Vec<_>>(),
+            )
+        };
+        for algorithm in [Algorithm::Aes256Gcm, Algorithm::Chacha20Poly1305] {
+            let options = EncryptOptions {
+                algorithm,
+                key: vec![1; 32],
+                ..Default::default()
+            };
+            let (stream, _) = encrypt_stream(big(), options).unwrap();
+            assert_eq!(
+                err_msg(stream_to_buffer(stream, None).await),
+                "Encryption input exceeds maxInputSize (67108864 bytes). Raise maxInputSize or encrypt the data as separate smaller messages."
+            );
+            let options = DecryptOptions {
+                algorithm,
+                key: vec![1; 32],
+                iv: vec![0; 12],
+                auth_tag: Some(vec![0; 16]),
+                ..Default::default()
+            };
+            assert_eq!(
+                err_msg(stream_to_buffer(decrypt_stream(big(), options).unwrap(), None).await),
+                "Decryption input exceeds maxInputSize (67108864 bytes)"
+            );
+        }
+
+        // usize::MAX is the "no limit" opt-out (JS `null`): the running byte
+        // count must not overflow into a false rejection.
+        let (ct, value) = encrypt(
+            PLAINTEXT,
+            5,
+            EncryptOptions {
+                key: vec![1; 32],
+                max_input_size: Some(usize::MAX),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let options = DecryptOptions {
+            key: vec![1; 32],
+            iv: bytes(&value["iv"]),
+            auth_tag: Some(bytes(&value["authTag"])),
+            max_input_size: Some(usize::MAX),
+            max_output_size: Some(usize::MAX),
+            ..Default::default()
+        };
+        assert_eq!(decrypt(&ct, 5, options).await.unwrap(), PLAINTEXT);
     }
 
     #[test]

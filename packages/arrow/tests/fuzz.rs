@@ -105,7 +105,12 @@ proptest! {
             .map(|row| Value::Object(row.into_iter().collect::<Map<_, _>>()))
             .collect();
         if let Err(e) = roundtrip(input, false) {
-            prop_assert!(e.to_string().contains("cannot append"), "{e}");
+            // e.g. `arrowBatchFromObjectStream: row 3, field "a" expects Int32, got "x"`
+            let e = e.to_string();
+            prop_assert!(
+                e.starts_with("arrowBatchFromObjectStream: row ") && e.contains("\" expects "),
+                "{e}"
+            );
         }
     }
 

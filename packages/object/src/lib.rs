@@ -11,8 +11,8 @@ use std::sync::Arc;
 
 use async_stream::try_stream;
 use datastream_core::{
-    create_pass_through_stream, create_readable_stream, create_transform_stream, deep_equal, noop,
-    noop_flush, DataStream, Map, Result, StreamExt, StreamResult, Value,
+    create_pass_through_stream, create_transform_stream, deep_equal, noop, noop_flush, DataStream,
+    Map, Result, StreamExt, StreamResult, Value,
 };
 use serde_json::json;
 
@@ -92,16 +92,6 @@ impl<S: Into<String>> From<Vec<S>> for Keys {
     }
 }
 
-// *** Readable *** //
-
-pub fn object_readable_stream<I>(input: I) -> DataStream<Value>
-where
-    I: IntoIterator<Item = Value>,
-    I::IntoIter: Send + 'static,
-{
-    create_readable_stream(input)
-}
-
 // *** Count *** //
 
 #[derive(Default, Clone, Debug)]
@@ -109,13 +99,13 @@ pub struct ObjectCountOptions {
     pub result_key: Option<String>,
 }
 
-/// Count chunks. Result key defaults to "count".
+/// Count chunks. Result key defaults to "objectCount".
 pub fn object_count_stream<T: Send + 'static>(
     input: DataStream<T>,
     options: ObjectCountOptions,
 ) -> (DataStream<T>, StreamResult) {
     let result = StreamResult::new(
-        options.result_key.unwrap_or_else(|| "count".into()),
+        options.result_key.unwrap_or_else(|| "objectCount".into()),
         json!(0),
     );
     let r = result.clone();
@@ -203,6 +193,9 @@ pub fn object_pivot_long_to_wide_stream(
                 .and_then(Value::as_object)
                 .cloned()
                 .unwrap_or_default();
+            // Drop the long-format columns BEFORE adding pivoted ones, so a pivoted
+            // column named like a key or value_param is not deleted afterwards.
+            row.retain(|k, _| !keys.contains(k) && *k != value_param);
             for chunk in &chunks {
                 let key_param = keys
                     .iter()
@@ -211,7 +204,6 @@ pub fn object_pivot_long_to_wide_stream(
                     .join(delimiter.as_str());
                 row.insert(key_param, field_or_null(chunk, &value_param));
             }
-            row.retain(|k, _| !keys.contains(k) && *k != value_param);
             enqueue.push(Value::Object(row));
             Ok(())
         },
@@ -520,7 +512,7 @@ pub fn object_skip_consecutive_duplicates_stream(input: DataStream<Value>) -> Da
 #[cfg(test)]
 mod tests {
     use super::*;
-    use datastream_core::{pipeline, stream_to_array};
+    use datastream_core::{create_readable_stream, pipeline, stream_to_array};
 
     fn from(input: Value) -> DataStream<Value> {
         let Value::Array(items) = input else {
@@ -538,23 +530,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn readable_reads_chunks() {
-        let input = json!([{"a": "1"}, {"b": "2"}, {"c": "3"}]);
-        let Value::Array(items) = input.clone() else {
-            unreachable!()
-        };
-        assert_eq!(collect(object_readable_stream(items)).await, input);
-        assert_eq!(collect(object_readable_stream(Vec::new())).await, json!([]));
-    }
-
-    #[tokio::test]
     async fn count_counts_chunks() {
         let (stream, count) =
             object_count_stream(create_readable_stream(["1", "2", "3"]), Default::default());
         let output = pipeline(stream, &[&count]).await.unwrap();
-        assert_eq!(count.key(), "count");
+        assert_eq!(count.key(), "objectCount");
         assert_eq!(count.get(), json!(3));
-        assert_eq!(output["count"], json!(3));
+        assert_eq!(output["objectCount"], json!(3));
 
         let options = ObjectCountOptions {
             result_key: Some("object".into()),
@@ -679,6 +661,27 @@ mod tests {
             collect(object_pivot_long_to_wide_stream(from(input), pivot)).await,
             json!([{"a": "1", "l-m": 1, "w-m": 2}])
         );
+    }
+
+    #[tokio::test]
+    async fn pivot_long_to_wide_keeps_column_named_like_key() {
+        let input = json!([[
+            {"id": 1, "metric": "value", "value": 5},
+            {"id": 1, "metric": "metric", "value": 7},
+            {"id": 1, "metric": "cost", "value": 9}
+        ]]);
+        let pivot = ObjectPivotLongToWideOptions {
+            keys: keys(&["metric"]),
+            value_param: "value".into(),
+            ..Default::default()
+        };
+        let output = collect(object_pivot_long_to_wide_stream(from(input), pivot)).await;
+        assert_eq!(
+            output,
+            json!([{"id": 1, "value": 5, "metric": 7, "cost": 9}])
+        );
+        let order: Vec<&String> = output[0].as_object().unwrap().keys().collect();
+        assert_eq!(order, ["id", "value", "metric", "cost"]);
     }
 
     #[tokio::test]

@@ -48,7 +48,7 @@ fn options(charset: &str) -> CharsetOptions {
 
 async fn decode(chunks: Vec<Vec<u8>>, charset: &str) -> String {
     stream_to_string(
-        charset_decode_stream(create_readable_stream(chunks), options(charset)),
+        charset_decode_stream(create_readable_stream(chunks), options(charset)).unwrap(),
         None,
     )
     .await
@@ -80,7 +80,8 @@ proptest! {
         prop_assume!(!text.starts_with('\u{feff}'));
         let decoded = block_on(async {
             let bytes = stream_to_buffer(
-                charset_encode_stream(create_readable_stream(vec![text.clone()]), options(charset)),
+                charset_encode_stream(create_readable_stream(vec![text.clone()]), options(charset))
+                    .unwrap(),
                 None,
             )
             .await
@@ -103,11 +104,9 @@ proptest! {
 
     #[test]
     fn fuzz_encode_any_label(text in ".{0,64}", charset in ".{0,16}") {
-        // Unknown labels fall back to UTF-8; nothing panics.
-        block_on(stream_to_buffer(
-            charset_encode_stream(create_readable_stream(vec![text]), options(&charset)),
-            None,
-        ))
-        .unwrap();
+        // Unknown labels error up front; known ones encode; nothing panics.
+        if let Ok(stream) = charset_encode_stream(create_readable_stream(vec![text]), options(&charset)) {
+            block_on(stream_to_buffer(stream, None)).unwrap();
+        }
     }
 }

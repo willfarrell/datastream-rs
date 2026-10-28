@@ -9,17 +9,20 @@ use aws_sdk_sqs::operation::delete_message_batch::builders::DeleteMessageBatchFl
 use aws_sdk_sqs::operation::receive_message::builders::ReceiveMessageFluentBuilder;
 use aws_sdk_sqs::operation::send_message_batch::builders::SendMessageBatchFluentBuilder;
 use aws_sdk_sqs::types::{
-    DeleteMessageBatchRequestEntry, Message, MessageAttributeValue, SendMessageBatchRequestEntry,
+    BatchResultErrorEntry, DeleteMessageBatchRequestEntry, Message, MessageAttributeValue,
+    SendMessageBatchRequestEntry,
 };
 use datastream_core::{DataStream, Error, Result};
 
 use crate::client::{
-    batch_write, cause_error, send, AwsPollingOptions, AwsWriteOptions, Batcher, IntoVec, Retry,
+    batch_write, cause_error, describe_list, send, AwsPollingOptions, AwsWriteOptions, Batcher,
+    IntoVec, Retry, Sent,
 };
 
-// SendMessageBatch/DeleteMessageBatch: <=10 entries, <=256KiB aggregate payload.
+// SendMessageBatch/DeleteMessageBatch: <=10 entries. SendMessageBatch also caps
+// the aggregate payload at 1MiB (raised from 256KiB in Aug 2025).
 const SQS_MAX_ENTRIES: usize = 10;
-const SQS_MAX_BATCH_BYTES: usize = 256 * 1024;
+const SQS_MAX_BATCH_BYTES: usize = 1024 * 1024;
 
 /// Receive messages until the queue is empty (or forever with `polling_active`).
 pub fn aws_sqs_receive_message_stream(
@@ -44,7 +47,11 @@ pub fn aws_sqs_receive_message_stream(
     })
 }
 
-/// Send entries with SendMessageBatch, retrying the `Failed` subset.
+/// Send entries with SendMessageBatch, batching by the SQS message size (body
+/// plus attribute names, types and values) and retrying the `Failed` subset
+/// (except `SenderFault` entries, which retrying cannot fix). On an input error
+/// or abort, entries still buffered come back as
+/// [`AwsUnsentError`](crate::AwsUnsentError) (not sent).
 pub async fn aws_sqs_send_message_stream(
     input: DataStream<SendMessageBatchRequestEntry>,
     request: SendMessageBatchFluentBuilder,
@@ -58,7 +65,7 @@ pub async fn aws_sqs_send_message_stream(
         size: |entry| entry.message_body().len() + attributes_size(entry.message_attributes()),
         oversize: |entry, bytes| {
             oversize(
-                "awsSQSSendMessageBatch entry exceeds 256KiB limit",
+                "awsSQSSendMessageBatch entry exceeds 1MiB limit",
                 entry.id(),
                 bytes,
             )
@@ -70,19 +77,15 @@ pub async fn aws_sqs_send_message_stream(
         let signal = signal.clone();
         async move {
             let output = send(request.send(), signal.as_ref()).await?;
-            let failed: HashSet<&str> = output.failed().iter().map(|e| e.id()).collect();
-            let cause = format!("{:?}", output.failed());
-            let entries = entries
-                .into_iter()
-                .filter(|e| failed.contains(e.id()))
-                .collect();
-            Ok::<_, Error>((entries, cause))
+            Ok::<_, Error>(sent(entries, output.failed(), |e| e.id()))
         }
     })
     .await
 }
 
-/// Delete entries with DeleteMessageBatch, retrying the `Failed` subset.
+/// Delete entries with DeleteMessageBatch (batched by count only: it carries no
+/// message bytes), retrying the `Failed` subset as for
+/// [`aws_sqs_send_message_stream`].
 pub async fn aws_sqs_delete_message_stream(
     input: DataStream<DeleteMessageBatchRequestEntry>,
     request: DeleteMessageBatchFluentBuilder,
@@ -91,16 +94,10 @@ pub async fn aws_sqs_delete_message_stream(
     let signal = options.signal.clone();
     let batcher = Batcher::<DeleteMessageBatchRequestEntry> {
         max_entries: SQS_MAX_ENTRIES,
-        max_entry_bytes: SQS_MAX_BATCH_BYTES,
-        max_batch_bytes: SQS_MAX_BATCH_BYTES,
-        size: |entry| entry.id().len() + entry.receipt_handle().len(),
-        oversize: |entry, bytes| {
-            oversize(
-                "awsSQSDeleteMessageBatch entry exceeds 256KiB limit",
-                entry.id(),
-                bytes,
-            )
-        },
+        max_entry_bytes: usize::MAX,
+        max_batch_bytes: usize::MAX,
+        size: |_| 0,
+        oversize: |_, _| unreachable!("no byte limit"),
     };
     let retry = retry(options, "awsSQSDeleteMessageBatch has failed entries");
     batch_write(input, batcher, retry, move |entries| {
@@ -108,13 +105,7 @@ pub async fn aws_sqs_delete_message_stream(
         let signal = signal.clone();
         async move {
             let output = send(request.send(), signal.as_ref()).await?;
-            let failed: HashSet<&str> = output.failed().iter().map(|e| e.id()).collect();
-            let cause = format!("{:?}", output.failed());
-            let entries = entries
-                .into_iter()
-                .filter(|e| failed.contains(e.id()))
-                .collect();
-            Ok::<_, Error>((entries, cause))
+            Ok::<_, Error>(sent(entries, output.failed(), |e| e.id()))
         }
     })
     .await
@@ -125,7 +116,28 @@ fn retry(options: AwsWriteOptions, message: &'static str) -> Retry {
         max_count: options.retry_max_count.unwrap_or(10),
         signal: options.signal,
         message,
+        describe: describe_list,
     }
+}
+
+// SenderFault marks a permanent (caller-side) failure: set it aside and only
+// retry the rest.
+fn sent<E>(entries: Vec<E>, failures: &[BatchResultErrorEntry], id: fn(&E) -> &str) -> Sent<E> {
+    let mut sent = Sent::ok();
+    let mut retry = HashSet::new();
+    for failure in failures {
+        if failure.sender_fault() {
+            sent.permanent.push(format!("{failure:?}"));
+        } else {
+            retry.insert(failure.id());
+            sent.failed.push(format!("{failure:?}"));
+        }
+    }
+    sent.retry = entries
+        .into_iter()
+        .filter(|e| retry.contains(id(e)))
+        .collect();
+    sent
 }
 
 fn oversize(message: &str, id: &str, bytes: usize) -> Error {
@@ -307,7 +319,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_message_stream_flushes_before_256kib() {
+    async fn send_message_stream_flushes_before_1mib() {
         let sizes = Arc::new(Mutex::new(Vec::new()));
         let seen = sizes.clone();
         let rule = mock!(Client::send_message_batch).then_compute_output(move |req| {
@@ -315,7 +327,7 @@ mod tests {
             send_output(&[])
         });
         let client = mock_client!(aws_sdk_sqs, RuleMode::MatchAny, [&rule]);
-        let body = "x".repeat(100 * 1024);
+        let body = "x".repeat(400 * 1024);
         let input = vec![entry("1", &body), entry("2", &body), entry("3", &body)];
         aws_sqs_send_message_stream(
             create_readable_stream(input),
@@ -328,7 +340,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_message_stream_keeps_exactly_256kib_in_one_batch() {
+    async fn send_message_stream_keeps_exactly_1mib_in_one_batch() {
         let sizes = Arc::new(Mutex::new(Vec::new()));
         let seen = sizes.clone();
         let rule = mock!(Client::send_message_batch).then_compute_output(move |req| {
@@ -336,7 +348,7 @@ mod tests {
             send_output(&[])
         });
         let client = mock_client!(aws_sdk_sqs, RuleMode::MatchAny, [&rule]);
-        let half = "x".repeat(128 * 1024);
+        let half = "x".repeat(512 * 1024);
         let input = vec![entry("1", &half), entry("2", &half)];
         aws_sqs_send_message_stream(
             create_readable_stream(input),
@@ -352,7 +364,7 @@ mod tests {
     async fn send_message_stream_rejects_oversize_entry() {
         let rule = mock!(Client::send_message_batch).then_output(|| send_output(&[]));
         let client = mock_client!(aws_sdk_sqs, RuleMode::MatchAny, [&rule]);
-        // Exactly 256KiB is allowed, one byte more is rejected.
+        // Exactly 1MiB is allowed, one byte more is rejected.
         let ok = vec![entry("1", &"x".repeat(SQS_MAX_BATCH_BYTES))];
         aws_sqs_send_message_stream(
             create_readable_stream(ok),
@@ -371,11 +383,11 @@ mod tests {
         .unwrap_err();
         assert_eq!(
             e.to_string(),
-            "awsSQSSendMessageBatch entry exceeds 256KiB limit"
+            "awsSQSSendMessageBatch entry exceeds 1MiB limit"
         );
         assert_eq!(
             e.downcast_ref::<crate::CauseError>().unwrap().cause,
-            "Id: big, bytes: 262145, limit: 262144"
+            "Id: big, bytes: 1048577, limit: 1048576"
         );
         assert_eq!(rule.num_calls(), 1);
     }
@@ -511,9 +523,14 @@ mod tests {
         assert_eq!(e.to_string(), "awsSQSDeleteMessageBatch has failed entries");
     }
 
+    // DeleteMessageBatch carries no message bytes, so only the 10-entry cap
+    // applies, however large the receipt handles.
     #[tokio::test]
-    async fn delete_message_stream_rejects_oversize_entry() {
-        let rule = mock!(Client::delete_message_batch).then_output(|| {
+    async fn delete_message_stream_batches_by_count_only() {
+        let sizes = Arc::new(Mutex::new(Vec::new()));
+        let seen = sizes.clone();
+        let rule = mock!(Client::delete_message_batch).then_compute_output(move |req| {
+            seen.lock().unwrap().push(req.entries().len());
             DeleteMessageBatchOutput::builder()
                 .set_successful(Some(Vec::new()))
                 .set_failed(Some(Vec::new()))
@@ -521,22 +538,102 @@ mod tests {
                 .unwrap()
         });
         let client = mock_client!(aws_sdk_sqs, RuleMode::MatchAny, [&rule]);
-        let big = DeleteMessageBatchRequestEntry::builder()
-            .id("1")
-            .receipt_handle("r".repeat(SQS_MAX_BATCH_BYTES))
-            .build()
-            .unwrap();
-        let e = aws_sqs_delete_message_stream(
-            create_readable_stream(vec![big]),
+        let input = (0..11)
+            .map(|i| {
+                DeleteMessageBatchRequestEntry::builder()
+                    .id(i.to_string())
+                    .receipt_handle("r".repeat(200 * 1024))
+                    .build()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        aws_sqs_delete_message_stream(
+            create_readable_stream(input),
             client.delete_message_batch(),
             AwsWriteOptions::default(),
         )
         .await
+        .unwrap();
+        assert_eq!(*sizes.lock().unwrap(), [10, 1]);
+    }
+
+    // SenderFault entries are set aside (never retried) while retryable
+    // failures in the same batch back off; the error then names every entry
+    // that did not get through, SenderFault first.
+    #[tokio::test(start_paused = true)]
+    async fn send_message_stream_retries_retryable_alongside_sender_fault() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let seen = calls.clone();
+        let rule = mock!(Client::send_message_batch).then_compute_output(move |req| {
+            let ids: Vec<String> = req.entries().iter().map(|e| e.id().to_string()).collect();
+            let mut calls = seen.lock().unwrap();
+            calls.push(ids);
+            let throttled = BatchResultErrorEntry::builder()
+                .id("0")
+                .code("Throttled")
+                .sender_fault(false)
+                .build()
+                .unwrap();
+            let permanent = BatchResultErrorEntry::builder()
+                .id("1")
+                .code("InvalidParameterValue")
+                .sender_fault(true)
+                .build()
+                .unwrap();
+            let failed = match calls.len() {
+                1 => vec![throttled, permanent],
+                _ => vec![throttled],
+            };
+            SendMessageBatchOutput::builder()
+                .set_successful(Some(Vec::new()))
+                .set_failed(Some(failed))
+                .build()
+                .unwrap()
+        });
+        let client = mock_client!(aws_sdk_sqs, RuleMode::MatchAny, [&rule]);
+        let e = aws_sqs_send_message_stream(
+            create_readable_stream(vec![entry("0", "a"), entry("1", "b")]),
+            client.send_message_batch(),
+            AwsWriteOptions {
+                retry_max_count: Some(1),
+                ..Default::default()
+            },
+        )
+        .await
         .unwrap_err();
-        assert_eq!(
-            e.to_string(),
-            "awsSQSDeleteMessageBatch entry exceeds 256KiB limit"
-        );
+        assert_eq!(e.to_string(), "awsSQSSendMessageBatch has failed entries");
+        let cause = &e.downcast_ref::<crate::CauseError>().unwrap().cause;
+        let permanent = cause.find("InvalidParameterValue").unwrap();
+        assert!(permanent < cause.find("Throttled").unwrap(), "{cause}");
+        // Only the retryable entry is re-sent.
+        assert_eq!(*calls.lock().unwrap(), [vec!["0", "1"], vec!["0"]]);
+    }
+
+    #[tokio::test]
+    async fn send_message_stream_abort_attaches_buffered_entries() {
+        let rule = mock!(Client::send_message_batch).then_output(|| send_output(&[]));
+        let client = mock_client!(aws_sdk_sqs, RuleMode::MatchAny, [&rule]);
+        let signal = CancellationToken::new();
+        let (sender, input) = datastream_core::create_readable_channel(None);
+        let task = tokio::spawn(aws_sqs_send_message_stream(
+            input,
+            client.send_message_batch(),
+            AwsWriteOptions {
+                signal: Some(signal.clone()),
+                ..Default::default()
+            },
+        ));
+        sender.send(entry("0", "m")).await.unwrap();
+        sender.send(entry("1", "m")).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        signal.cancel();
+        let e = task.await.unwrap().unwrap_err();
+        assert_eq!(e.to_string(), "Aborted");
+        let unsent = e
+            .downcast_ref::<crate::AwsUnsentError<SendMessageBatchRequestEntry>>()
+            .unwrap();
+        assert_eq!(unsent.failed_messages, [entry("0", "m"), entry("1", "m")]);
+        assert_eq!(rule.num_calls(), 0);
     }
 
     #[test]

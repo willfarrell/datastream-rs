@@ -1,12 +1,13 @@
 [package]
 name = "datastream-duckdb"
-description = "DuckDB writable streams (appender) for async Rust streams"
+description = "DuckDB query readable and writable (appender) streams for async Rust streams"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
 [dependencies]
+async-stream.workspace = true
 datastream-core.workspace = true
 duckdb = { version = "1", features = ["bundled", "appender-arrow"] }
 serde_json.workspace = true

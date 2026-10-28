@@ -18,6 +18,7 @@ pub struct AzurePollingOptions {
 }
 
 impl AzurePollingOptions {
+    #[cfg_attr(not(feature = "queue"), allow(dead_code))]
     pub(crate) async fn idle(&self) -> Result<()> {
         let delay = self.polling_delay.unwrap_or(Duration::from_secs(1));
         if delay.is_zero() {
@@ -27,7 +28,51 @@ impl AzurePollingOptions {
     }
 }
 
+/// A send stream ended early (input error or abort) with a partly filled batch:
+/// `failed_messages` were buffered but never sent, so callers can retry them.
+#[derive(Debug)]
+pub struct AzureFailedMessagesError<T> {
+    pub error: Error,
+    pub failed_messages: Vec<T>,
+}
+
+impl<T> std::fmt::Display for AzureFailedMessagesError<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(f)
+    }
+}
+
+impl<T: std::fmt::Debug> std::error::Error for AzureFailedMessagesError<T> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&*self.error)
+    }
+}
+
+/// Attach the unsent entries to `error` (left as-is when there are none).
+#[cfg_attr(not(feature = "event-hubs"), allow(dead_code))]
+pub(crate) fn with_failed_messages<T>(error: Error, failed_messages: Vec<T>) -> Error
+where
+    T: std::fmt::Debug + Send + Sync + 'static,
+{
+    if failed_messages.is_empty() {
+        return error;
+    }
+    Box::new(AzureFailedMessagesError {
+        error,
+        failed_messages,
+    })
+}
+
 /// Await an SDK call, failing with "Aborted" as soon as `signal` is cancelled.
+#[cfg_attr(
+    not(any(
+        feature = "blob",
+        feature = "cosmos",
+        feature = "event-hubs",
+        feature = "queue"
+    )),
+    allow(dead_code)
+)]
 pub(crate) async fn send<T, E: Into<Error>>(
     request: impl Future<Output = Result<T, E>>,
     signal: Option<&CancellationToken>,
@@ -122,6 +167,22 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(e.to_string(), "Aborted");
+    }
+
+    #[test]
+    fn with_failed_messages_attaches_entries() {
+        let e = with_failed_messages("boom".into(), vec!["a", "b"]);
+        assert_eq!(e.to_string(), "boom");
+        let e = e.downcast_ref::<AzureFailedMessagesError<&str>>().unwrap();
+        assert_eq!(e.failed_messages, ["a", "b"]);
+        assert_eq!(std::error::Error::source(e).unwrap().to_string(), "boom");
+    }
+
+    #[test]
+    fn with_failed_messages_keeps_error_without_entries() {
+        let e = with_failed_messages("boom".into(), Vec::<&str>::new());
+        assert_eq!(e.to_string(), "boom");
+        assert!(e.downcast_ref::<AzureFailedMessagesError<&str>>().is_none());
     }
 
     #[tokio::test(start_paused = true)]

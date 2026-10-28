@@ -94,7 +94,11 @@ proptest! {
         let envelopes = block_on(confluent_unframe(framed)).unwrap();
         let expected: Vec<_> = payloads
             .into_iter()
-            .map(|payload| ConfluentEnvelope { schema_id, payload })
+            .map(|payload| ConfluentEnvelope {
+                schema_id,
+                payload,
+                message: (),
+            })
             .collect();
         prop_assert_eq!(envelopes, expected);
     }
@@ -129,6 +133,7 @@ proptest! {
                 schema_version_id: uuid(id),
                 compression,
                 payload,
+                message: (),
             })
             .collect();
         prop_assert_eq!(envelopes, expected);

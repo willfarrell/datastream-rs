@@ -2,11 +2,19 @@
 // SPDX-License-Identifier: MIT
 //! JSON Schema validation stream, ported from `@datastream/validate`.
 //!
-//! The JS version uses Ajv. Validation here is done by the `jsonschema`
-//! crate (draft-07, Ajv's default), with the Ajv behaviour the JS relies on
-//! layered on top: `coerceTypes`, `useDefaults: "empty"`, `strict` unknown
-//! keywords, Ajv-style messages / `schemaPath`s, and `ajv-errors`'
-//! `errorMessage` keyword (string form, keyword form, and `properties`).
+//! The JS version uses Ajv (via `ajv-cmd/compile`). Validation here is done
+//! by the `jsonschema` crate (JSON Schema 2020-12, the dialect `ajv-cmd`
+//! compiles with, formats asserted like `ajv-formats`), with the Ajv
+//! behaviour the JS relies on layered on top: `coerceTypes`,
+//! `useDefaults: "empty"`, `strict` unknown keywords and formats, Ajv-style
+//! messages / `schemaPath`s, and `ajv-errors`' `errorMessage` keyword (string
+//! form, keyword form, and `properties`).
+//!
+//! Not ported (Ajv plugins with no `jsonschema` equivalent): `ajv-keywords`
+//! (`transform`, `typeof`, `range`, ...), Ajv's `nullable` / `$async` /
+//! `discriminator`, and the `ajv-formats` formats `jsonschema` lacks
+//! (`int32`, `int64`, `float`, `double`, `byte`, `binary`, `password`, `url`,
+//! `iso-time`, `iso-date-time`), which are accepted but not asserted.
 
 use std::fmt;
 use std::sync::Arc;
@@ -18,7 +26,9 @@ use jsonschema::error::ValidationErrorKind;
 use serde_json::json;
 
 /// Ajv options. Each defaults to `true` like the JS `ajvDefaults`
-/// (`use_defaults` means Ajv's `"empty"` mode).
+/// (`use_defaults` means Ajv's `"empty"` mode). `all_errors: false` stops at
+/// the first error and, like `ajv-cmd`, drops `errorMessage` (then an unknown
+/// keyword in strict mode).
 #[derive(Default, Clone, Debug)]
 pub struct TranspileOptions {
     pub strict: Option<bool>,
@@ -68,16 +78,23 @@ impl From<CompiledSchema> for Schema {
     }
 }
 
+/// The keywords Ajv 2020 knows in strict mode (minus the Ajv-only `$async`,
+/// `nullable`, `$recursiveAnchor` and `$recursiveRef`). Ajv rejects `$anchor`
+/// and `additionalItems` here too.
 const KEYWORDS: &[&str] = &[
     "$schema",
     "$id",
     "$ref",
+    "$dynamicRef",
+    "$dynamicAnchor",
+    "$vocabulary",
     "$comment",
     "$defs",
     "definitions",
     "title",
     "description",
     "default",
+    "deprecated",
     "examples",
     "readOnly",
     "writeOnly",
@@ -95,20 +112,27 @@ const KEYWORDS: &[&str] = &[
     "format",
     "contentMediaType",
     "contentEncoding",
+    "contentSchema",
+    "prefixItems",
     "items",
-    "additionalItems",
     "maxItems",
     "minItems",
     "uniqueItems",
     "contains",
+    "maxContains",
+    "minContains",
+    "unevaluatedItems",
     "maxProperties",
     "minProperties",
     "required",
+    "dependentRequired",
     "properties",
     "patternProperties",
     "additionalProperties",
     "dependencies",
+    "dependentSchemas",
     "propertyNames",
+    "unevaluatedProperties",
     "if",
     "then",
     "else",
@@ -116,7 +140,41 @@ const KEYWORDS: &[&str] = &[
     "anyOf",
     "oneOf",
     "not",
-    "errorMessage",
+];
+
+/// Formats `ajv-formats` and `ajv-formats-draft2019` register. Any other
+/// format is a strict-mode compile error, as in Ajv.
+const FORMATS: &[&str] = &[
+    "date",
+    "time",
+    "date-time",
+    "iso-time",
+    "iso-date-time",
+    "duration",
+    "uri",
+    "uri-reference",
+    "uri-template",
+    "url",
+    "email",
+    "hostname",
+    "ipv4",
+    "ipv6",
+    "regex",
+    "uuid",
+    "json-pointer",
+    "json-pointer-uri-fragment",
+    "relative-json-pointer",
+    "byte",
+    "int32",
+    "int64",
+    "float",
+    "double",
+    "password",
+    "binary",
+    "idn-email",
+    "idn-hostname",
+    "iri",
+    "iri-reference",
 ];
 
 fn escape(segment: &str) -> String {
@@ -137,24 +195,27 @@ fn walk(
         let path = format!("{path}/{}", escape(key));
         match (key.as_str(), value) {
             (
-                "properties" | "patternProperties" | "definitions" | "$defs" | "dependencies",
+                "properties" | "patternProperties" | "definitions" | "$defs" | "dependencies"
+                | "dependentSchemas",
                 Value::Object(m),
             ) => {
                 for (name, sub) in m {
                     walk(sub, &format!("{path}/{}", escape(name)), f)?;
                 }
             }
-            ("items" | "allOf" | "anyOf" | "oneOf", Value::Array(subs)) => {
+            ("prefixItems" | "allOf" | "anyOf" | "oneOf", Value::Array(subs)) => {
                 for (i, sub) in subs.iter().enumerate() {
                     walk(sub, &format!("{path}/{i}"), f)?;
                 }
             }
             (
                 "items"
-                | "additionalItems"
                 | "contains"
                 | "additionalProperties"
                 | "propertyNames"
+                | "unevaluatedItems"
+                | "unevaluatedProperties"
+                | "contentSchema"
                 | "if"
                 | "then"
                 | "else"
@@ -167,28 +228,45 @@ fn walk(
     Ok(())
 }
 
-/// Compile a schema with Ajv-like defaults. Strict mode rejects unknown keywords.
+/// Compile a schema with Ajv-like defaults. Strict mode rejects unknown
+/// keywords and formats.
 pub fn transpile_schema(schema: &Value, options: TranspileOptions) -> Result<CompiledSchema> {
     let strict = options.strict.unwrap_or(true);
+    // ajv-errors needs allErrors, so `ajv-cmd` only registers it with it.
+    let all_errors = options.all_errors.unwrap_or(true);
     let mut error_messages = Vec::new();
     walk(schema, "", &mut |path, map| {
         if strict {
-            if let Some(key) = map.keys().find(|k| !KEYWORDS.contains(&k.as_str())) {
+            let known =
+                |k: &String| KEYWORDS.contains(&k.as_str()) || (all_errors && k == "errorMessage");
+            if let Some(key) = map.keys().find(|k| !known(k)) {
                 return Err(format!("strict mode: unknown keyword: \"{key}\"").into());
             }
+            if let Some(Value::String(format)) = map.get("format") {
+                if !FORMATS.contains(&format.as_str()) {
+                    return Err(format!(
+                        "unknown format \"{format}\" ignored in schema at path \"#{path}\""
+                    )
+                    .into());
+                }
+            }
         }
-        if let Some(message) = map.get("errorMessage") {
+        if let (true, Some(message)) = (all_errors, map.get("errorMessage")) {
             error_messages.push((path.to_string(), message.clone()));
         }
         Ok(())
     })?;
-    let validator = jsonschema::draft7::new(schema).map_err(|e| e.to_string())?;
+    let validator = jsonschema::options()
+        .with_draft(jsonschema::Draft::Draft202012)
+        .should_validate_formats(true)
+        .build(schema)
+        .map_err(|e| e.to_string())?;
     Ok(CompiledSchema {
         schema: Arc::new(schema.clone()),
         validator: Arc::new(validator),
         error_messages: Arc::new(error_messages),
         coerce_types: options.coerce_types.unwrap_or(true),
-        all_errors: options.all_errors.unwrap_or(true),
+        all_errors,
         use_defaults: options.use_defaults.unwrap_or(true),
         messages: options.messages.unwrap_or(true),
     })
@@ -369,19 +447,21 @@ impl CompiledSchema {
                     }
                 }
             }
-            Value::Array(items) => match s.get("items") {
-                Some(Value::Array(subs)) => {
-                    for (sub, value) in subs.iter().zip(items.iter_mut()) {
+            Value::Array(items) => {
+                // 2020-12 tuples: `prefixItems` per position, `items` for the rest.
+                let prefix = match s.get("prefixItems") {
+                    Some(Value::Array(subs)) => subs.as_slice(),
+                    _ => &[],
+                };
+                for (sub, value) in prefix.iter().zip(items.iter_mut()) {
+                    self.prepare(sub, value);
+                }
+                if let Some(sub) = s.get("items") {
+                    for value in items.iter_mut().skip(prefix.len()) {
                         self.prepare(sub, value);
                     }
                 }
-                Some(sub) => {
-                    for value in items.iter_mut() {
-                        self.prepare(sub, value);
-                    }
-                }
-                None => {}
-            },
+            }
             _ => {}
         }
     }
@@ -426,8 +506,21 @@ impl CompiledSchema {
                     }
                 }
                 _ => {
-                    let text = ajv_message(keyword, self.schema.pointer(e.schema_path().as_str()))
-                        .unwrap_or_else(|| e.to_string());
+                    let at = e.schema_path().as_str();
+                    let text = match (keyword, self.schema.pointer(at)) {
+                        // `items: false` after `prefixItems` caps the length.
+                        ("items", Some(Value::Bool(false))) => {
+                            let parent = &at[..at.len() - "/items".len()];
+                            let limit = self
+                                .schema
+                                .pointer(&format!("{parent}/prefixItems"))
+                                .and_then(Value::as_array)
+                                .map_or(0, Vec::len);
+                            Some(format!("must NOT have more than {limit} items"))
+                        }
+                        (keyword, value) => ajv_message(keyword, value),
+                    }
+                    .unwrap_or_else(|| e.to_string());
                     errors.push(AjvError::new(
                         keyword,
                         &schema_path,
@@ -515,7 +608,10 @@ pub struct ValidateOptions {
     /// `Some(false)` emits the original rows instead of the coerced ones.
     pub allow_coerce_types: Option<bool>,
     pub result_key: Option<String>,
+    /// `idx` entries kept per error id. Defaults to 1000; `usize::MAX` for
+    /// unlimited.
     pub max_error_rows: Option<usize>,
+    /// Distinct error ids kept. Defaults to 1000; `usize::MAX` for unlimited.
     pub max_error_keys: Option<usize>,
 }
 
@@ -534,7 +630,7 @@ pub fn validate_stream(
             Some(Schema::Json(json)) => transpile_schema(&json, TranspileOptions::default())?,
             Some(Schema::Compiled(compiled)) => compiled,
         };
-    let max_error_rows = options.max_error_rows.unwrap_or(usize::MAX);
+    let max_error_rows = options.max_error_rows.unwrap_or(1000);
     let max_error_keys = options.max_error_keys.unwrap_or(1000);
     let on_error_enqueue = options.on_error_enqueue.unwrap_or(false);
     let emit_original = options.allow_coerce_types == Some(false);
@@ -928,5 +1024,151 @@ mod tests {
             ..Default::default()
         };
         assert!(transpile_schema(&schema, lax).is_ok());
+        // Ajv 2020 drops these.
+        for keyword in ["additionalItems", "$anchor", "nullable"] {
+            let schema = json!({ keyword: false });
+            assert!(transpile_schema(&schema, Default::default()).is_err());
+        }
+    }
+
+    #[test]
+    fn strict_rejects_unknown_formats() {
+        let schema = json!({"properties": {"a": {"type": "string", "format": "foo"}}});
+        let e = transpile_schema(&schema, Default::default()).err().unwrap();
+        assert_eq!(
+            e.to_string(),
+            "unknown format \"foo\" ignored in schema at path \"#/properties/a\""
+        );
+        let lax = TranspileOptions {
+            strict: Some(false),
+            ..Default::default()
+        };
+        assert!(transpile_schema(&schema, lax).is_ok());
+        // ajv-formats formats compile even where they are not asserted.
+        let schema = json!({"type": "string", "format": "int32"});
+        assert!(transpile_schema(&schema, Default::default()).is_ok());
+    }
+
+    #[tokio::test]
+    async fn uses_2020_12_dialect() {
+        // prefixItems is 2020-12 only.
+        let schema = json!({
+            "type": "array",
+            "prefixItems": [{ "type": "string" }],
+            "items": false,
+            "minItems": 1
+        });
+        assert_eq!(
+            output(vec![json!(["a"])], options(schema.clone())).await,
+            [json!(["a"])]
+        );
+        // prefixItems coerce like Ajv: a number becomes a string, an object can't.
+        assert_eq!(
+            output(vec![json!([1])], options(schema.clone())).await,
+            [json!(["1"])]
+        );
+        let result = errors(vec![json!([{}])], options(schema.clone())).await;
+        assert_eq!(
+            result,
+            json!({"#/prefixItems/0/type": {"id": "#/prefixItems/0/type", "keys": ["0"], "message": "must be string", "idx": [0]}})
+        );
+        let result = errors(vec![json!(["a", "b"])], options(schema)).await;
+        assert_eq!(result.as_object().unwrap().len(), 1);
+        assert_eq!(first(&result)["id"], "#/items");
+        assert_eq!(first(&result)["message"], "must NOT have more than 1 items");
+        // The draft-07 tuple form is no longer valid.
+        let tuple = json!({"type": "array", "items": [{ "type": "string" }]});
+        assert!(transpile_schema(&tuple, Default::default()).is_err());
+    }
+
+    #[tokio::test]
+    async fn asserts_formats() {
+        for (format, valid) in [("email", "a@example.com"), ("idn-email", "用户@例子.广告")] {
+            let schema = json!({ "type": "string", "format": format });
+            let input = vec![json!(valid), json!("not an email")];
+            let (stream, result) =
+                validate_stream(create_readable_stream(input), options(schema)).unwrap();
+            let output = pipeline(stream, &[&result]).await.unwrap();
+            let entry = &output["validate"]["#/format"];
+            assert_eq!(entry["idx"], json!([1]), "{format}");
+            assert_eq!(entry["message"], format!("must match format \"{format}\""));
+        }
+    }
+
+    #[tokio::test]
+    async fn all_errors_false() {
+        let schema = json!({
+            "type": "object",
+            "properties": { "a": { "type": "string" }, "b": { "type": "string" } },
+            "required": ["a", "b"]
+        });
+        let first_only = TranspileOptions {
+            all_errors: Some(false),
+            ..Default::default()
+        };
+        let compiled = transpile_schema(&schema, first_only.clone()).unwrap();
+        let opts = ValidateOptions {
+            schema: Some(compiled.into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            errors(vec![json!({})], opts)
+                .await
+                .as_object()
+                .unwrap()
+                .len(),
+            1
+        );
+        // errorMessage needs allErrors, so it is then an unknown keyword.
+        let schema = json!({"type": "object", "errorMessage": "nope"});
+        let e = transpile_schema(&schema, first_only).err().unwrap();
+        assert_eq!(
+            e.to_string(),
+            "strict mode: unknown keyword: \"errorMessage\""
+        );
+        // Without strict it is ignored.
+        let lax = TranspileOptions {
+            all_errors: Some(false),
+            strict: Some(false),
+            ..Default::default()
+        };
+        let opts = ValidateOptions {
+            schema: Some(transpile_schema(&schema, lax).unwrap().into()),
+            ..Default::default()
+        };
+        let result = errors(vec![json!("x")], opts).await;
+        assert_eq!(first(&result)["id"], "#/type");
+    }
+
+    #[tokio::test]
+    async fn max_error_limit_defaults() {
+        let schema = json!({"type": "object", "properties": {"a": {"type": "number"}}});
+        let bad_rows = |n: usize| {
+            (0..n)
+                .map(|i| json!({ "a": format!("bad{i}") }))
+                .collect::<Vec<_>>()
+        };
+        let capped = errors(bad_rows(1001), options(schema.clone())).await;
+        let idx = first(&capped)["idx"].as_array().unwrap().clone();
+        assert_eq!((idx.len(), idx.last().unwrap()), (1000, &json!(999)));
+        let unlimited = ValidateOptions {
+            max_error_rows: Some(usize::MAX),
+            ..options(schema)
+        };
+        let result = errors(bad_rows(1001), unlimited).await;
+        assert_eq!(first(&result)["idx"].as_array().unwrap().len(), 1001);
+
+        let schema = json!({"type": "object", "additionalProperties": false, "properties": {"a": {"type": "number"}}});
+        let input = (0..1001)
+            .map(|i| json!({ "a": 1, format!("extra_{i}"): i }))
+            .collect::<Vec<_>>();
+        let unlimited = ValidateOptions {
+            max_error_keys: Some(usize::MAX),
+            ..options(schema)
+        };
+        assert_eq!(
+            errors(input, unlimited).await.as_object().unwrap().len(),
+            1001
+        );
     }
 }

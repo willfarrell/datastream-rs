@@ -134,13 +134,24 @@ mod tests {
 
     #[test]
     fn unsupported_algorithm() {
-        let input = create_readable_stream(Vec::<Vec<u8>>::new());
-        let options = DigestOptions {
-            algorithm: "MD5".into(),
-            ..Default::default()
-        };
-        let e = digest_stream(input, options).err().unwrap();
-        assert_eq!(e.to_string(), "Unsupported algorithm: MD5");
+        // Names that are only Object.prototype keys in JS are rejected too.
+        for algorithm in ["MD5", "constructor", "__proto__", "toString", ""] {
+            let input = create_readable_stream(Vec::<Vec<u8>>::new());
+            let options = DigestOptions {
+                algorithm: algorithm.into(),
+                ..Default::default()
+            };
+            let e = digest_stream(input, options).err().unwrap();
+            assert_eq!(e.to_string(), format!("Unsupported algorithm: {algorithm}"));
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_stream() {
+        assert_eq!(
+            run(&[], "SHA2-256").await,
+            json!("SHA2-256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+        );
     }
 
     #[tokio::test]

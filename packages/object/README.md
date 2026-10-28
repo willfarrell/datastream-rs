@@ -2,7 +2,6 @@
 
 Object manipulation streams, ported from `@datastream/object`.
 
-- `object_readable_stream`
 - `object_count_stream`
 - `object_pick_stream`
 - `object_omit_stream`

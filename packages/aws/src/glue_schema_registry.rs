@@ -22,7 +22,8 @@ pub struct GlueSchema {
 pub struct AwsGlueSchemaRegistryOptions {
     /// How long a lookup stays cached (default: forever).
     pub cache_expiry: Option<Duration>,
-    /// Oldest entries are evicted past this many (default 1000).
+    /// Oldest entries are evicted past this many (default 1000; 0 disables
+    /// caching, `usize::MAX` never evicts).
     pub max_cache_size: Option<usize>,
 }
 
@@ -100,6 +101,9 @@ impl AwsGlueSchemaRegistryResolver {
         state.inflight.remove(schema_version_id);
         let value = result.map_err(Error::from)?;
         state.remove(schema_version_id);
+        if self.max_cache_size == 0 {
+            return Ok(value);
+        }
         while state.order.len() >= self.max_cache_size {
             let Some(oldest) = state.order.pop_front() else {
                 break;
@@ -221,6 +225,35 @@ mod tests {
         assert_eq!(rule.num_calls(), 4);
         resolve.resolve("b").await.unwrap();
         assert_eq!(rule.num_calls(), 5);
+    }
+
+    // A refreshed stale key moves to the FIFO tail, so the next eviction
+    // removes the oldest other key rather than the just-refreshed one.
+    #[tokio::test]
+    async fn requeues_a_refreshed_key_at_the_fifo_tail() {
+        let (client, rule) = echo_client();
+        let resolve = resolver(client, Some(Duration::from_millis(200)), Some(3));
+        resolve.resolve("v1").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        resolve.resolve("v2").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        // v1 is stale (250ms old) and refreshed; v2 (150ms old) is still fresh.
+        resolve.resolve("v1").await.unwrap();
+        resolve.resolve("v3").await.unwrap();
+        // Evicts the oldest entry: v2, not the refreshed v1.
+        resolve.resolve("v4").await.unwrap();
+        assert_eq!(rule.num_calls(), 5);
+        resolve.resolve("v1").await.unwrap();
+        assert_eq!(rule.num_calls(), 5);
+    }
+
+    #[tokio::test]
+    async fn max_cache_size_zero_does_not_cache() {
+        let (client, rule) = echo_client();
+        let resolve = resolver(client, None, Some(0));
+        resolve.resolve("v1").await.unwrap();
+        resolve.resolve("v1").await.unwrap();
+        assert_eq!(rule.num_calls(), 2);
     }
 
     #[tokio::test]

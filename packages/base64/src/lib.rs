@@ -14,6 +14,15 @@ const DECODER: GeneralPurpose = GeneralPurpose::new(
     GeneralPurposeConfig::new().with_decode_allow_trailing_bits(true),
 );
 
+/// Quote at most 32 chars of the offending input: a multi-megabyte bad chunk
+/// must not be copied into the error message (and on into logs).
+fn quote(s: &str) -> String {
+    match s.char_indices().nth(32) {
+        Some((end, _)) => format!("{:?}", format!("{}…", &s[..end])),
+        None => format!("{s:?}"),
+    }
+}
+
 /// Length must be a multiple of 4, with only alphabet chars followed by at
 /// most 2 `=`. Rejects fragments like `YQ=` and standalone padding like `==`.
 fn assert_valid_base64(s: &str) -> Result<()> {
@@ -26,7 +35,17 @@ fn assert_valid_base64(s: &str) -> Result<()> {
     if valid {
         Ok(())
     } else {
-        Err(format!("Invalid base64 string: {s:?}").into())
+        Err(format!("Invalid base64 string: {}", quote(s)).into())
+    }
+}
+
+/// A padded quartet split from the data after it (`["YQ==", "YWJj"]`) must
+/// fail like the same text in one chunk (`"YQ==YWJj"`) does.
+fn assert_not_after_padding(padded: bool, s: &str) -> Result<()> {
+    if padded {
+        Err(format!("Invalid base64 string: {} follows \"=\" padding", quote(s)).into())
+    } else {
+        Ok(())
     }
 }
 
@@ -60,6 +79,8 @@ where
 {
     Box::pin(try_stream! {
         let mut extra = String::new();
+        // "=" ends a base64 stream; set once a quartet with padding is decoded.
+        let mut padded = false;
         while let Some(chunk) = input.next().await {
             extra.push_str(&String::from_utf8_lossy(chunk?.as_ref()));
             // Validation rejects non-ASCII, so a non-boundary split only
@@ -70,7 +91,9 @@ where
             }
             if whole > 0 {
                 let s: String = extra.drain(..whole).collect();
+                assert_not_after_padding(padded, &s)?;
                 assert_valid_base64(&s)?;
+                padded = s.ends_with('=');
                 yield DECODER.decode(&s).map_err(Error::from)?;
             }
         }
@@ -208,6 +231,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn decode_rejects_data_after_padding_in_later_chunk() {
+        let e = decode(&["YWJjYQ==", "ZGVm"]).await.unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "Invalid base64 string: \"ZGVm\" follows \"=\" padding"
+        );
+        // Same text in one chunk is rejected by the alphabet check.
+        assert!(decode(&["YQ==YWJj"]).await.is_err());
+        // Padding in the final quartet of a later chunk is still fine.
+        assert_eq!(decode(&["YWJj", "YQ=="]).await.unwrap(), b"abca");
+    }
+
+    #[tokio::test]
+    async fn decode_emits_one_chunk_per_aligned_input_chunk() {
+        let out = stream_to_array(base64_decode_stream(strings(&["YWJj", "ZGVm"])), None)
+            .await
+            .unwrap();
+        assert_eq!(out, [b"abc".to_vec(), b"def".to_vec()]);
+    }
+
+    #[tokio::test]
+    async fn decode_error_quotes_at_most_32_chars() {
+        let bad = format!("!{}", "A".repeat(31));
+        let e = decode(&[bad.as_str()]).await.unwrap_err();
+        assert_eq!(e.to_string(), format!("Invalid base64 string: \"{bad}\""));
+
+        let bad = format!("!{}", "A".repeat(35));
+        let e = decode(&[bad.as_str()]).await.unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            format!("Invalid base64 string: \"!{}…\"", "A".repeat(31))
+        );
+
+        let long = "B".repeat(36);
+        let e = decode(&["YQ==", long.as_str()]).await.unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            format!(
+                "Invalid base64 string: \"{}…\" follows \"=\" padding",
+                "B".repeat(32)
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn decode_rejects_high_bit_bytes() {
+        let stream = base64_decode_stream(create_readable_stream([vec![0xD9, 0x57, 0x4A, 0x6A]]));
+        let e = stream_to_buffer(stream, None).await.unwrap_err();
+        assert!(e.to_string().starts_with("Invalid base64 string"));
+    }
+
+    #[tokio::test]
+    async fn encode_non_ascii_string_as_utf8() {
+        let out = stream_to_array(base64_encode_stream(strings(&["é"])), None)
+            .await
+            .unwrap();
+        assert_eq!(out.concat(), STANDARD.encode("é"));
+    }
+
+    #[tokio::test]
     async fn decode_accepts_padding() {
         assert_eq!(decode(&["YQ=="]).await.unwrap(), [0x61]);
         assert_eq!(decode(&["YWI="]).await.unwrap(), [0x61, 0x62]);
@@ -221,7 +304,10 @@ mod tests {
         // An incomplete quartet emits nothing before erroring at the end.
         let mut stream = base64_decode_stream(strings(&["YQ"]));
         let first = stream.next().await.unwrap();
-        assert!(first.is_err());
+        assert_eq!(
+            first.unwrap_err().to_string(),
+            "Invalid base64 string: \"YQ\""
+        );
         let out = stream_to_array(base64_decode_stream(strings(&["YWJj"])), None)
             .await
             .unwrap();

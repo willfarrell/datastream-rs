@@ -2,10 +2,10 @@
 // SPDX-License-Identifier: MIT
 use datastream_core::{create_readable_stream, pipeline, stream_to_array, DataStream};
 use datastream_string::{
-    string_count_stream, string_length_stream, string_minimum_chunk_size,
-    string_minimum_first_chunk_size, string_replace_stream, string_skip_consecutive_duplicates,
-    string_split_stream, StringCountOptions, StringLengthOptions, StringMinimumChunkSizeOptions,
-    StringReplaceOptions, StringSplitOptions,
+    string_count_stream, string_length_stream, string_minimum_chunk_size_stream,
+    string_minimum_first_chunk_size_stream, string_replace_stream,
+    string_skip_consecutive_duplicates_stream, string_split_stream, StringCountOptions,
+    StringLengthOptions, StringMinimumChunkSizeOptions, StringReplaceOptions, StringSplitOptions,
 };
 use proptest::prelude::*;
 use serde_json::json;
@@ -60,12 +60,12 @@ proptest! {
         )
         .unwrap();
         let output = block_on(pipeline(stream, &[&result])).unwrap();
-        prop_assert_eq!(&output["count"], &json!(count_overlapping(&input.concat(), &substr)));
+        prop_assert_eq!(&output["stringCount"], &json!(count_overlapping(&input.concat(), &substr)));
     }
 
     #[test]
     fn fuzz_string_skip_consecutive_duplicates(input in prop::collection::vec("[ab]{0,2}", 0..16)) {
-        let output = collect(string_skip_consecutive_duplicates(create_readable_stream(input.clone())));
+        let output = collect(string_skip_consecutive_duplicates_stream(create_readable_stream(input.clone())));
         let mut expected = input;
         expected.dedup();
         prop_assert_eq!(output, expected);
@@ -73,15 +73,34 @@ proptest! {
 
     #[test]
     fn fuzz_string_replace_stream(input in chunks(), pattern in needle(), replacement in text()) {
+        // `$$` is a literal `$` in a replacement template.
         let output = collect(string_replace_stream(
             create_readable_stream(input.clone()),
             StringReplaceOptions {
                 pattern: pattern.clone().into(),
-                replacement: replacement.clone(),
+                replacement: replacement.replace('$', "$$").into(),
                 ..Default::default()
             },
-        ));
+        ).unwrap());
         prop_assert_eq!(output.concat(), input.concat().replace(&pattern, &replacement));
+    }
+
+    #[test]
+    fn fuzz_string_replace_stream_regex(input in chunks(), pattern in needle(), replacement in text()) {
+        // A literal regex with its length as max_match_length behaves like the
+        // whole-string replacement.
+        let regex = regex::Regex::new(&regex::escape(&pattern)).unwrap();
+        let output = collect(string_replace_stream(
+            create_readable_stream(input.clone()),
+            StringReplaceOptions {
+                pattern: regex.clone().into(),
+                replacement: replacement.replace('$', "$$").into(),
+                max_match_length: Some(pattern.len()),
+                ..Default::default()
+            },
+        ).unwrap());
+        let joined = input.concat();
+        prop_assert_eq!(output.concat(), regex.replace_all(&joined, regex::NoExpand(&replacement)));
     }
 
     #[test]
@@ -100,7 +119,7 @@ proptest! {
 
     #[test]
     fn fuzz_string_minimum_first_chunk_size(input in chunks(), chunk_size in 0usize..64) {
-        let output = collect(string_minimum_first_chunk_size(
+        let output = collect(string_minimum_first_chunk_size_stream(
             create_readable_stream(input.clone()),
             StringMinimumChunkSizeOptions { chunk_size: Some(chunk_size) },
         ));
@@ -112,7 +131,7 @@ proptest! {
 
     #[test]
     fn fuzz_string_minimum_chunk_size(input in chunks(), chunk_size in 0usize..64) {
-        let output = collect(string_minimum_chunk_size(
+        let output = collect(string_minimum_chunk_size_stream(
             create_readable_stream(input.clone()),
             StringMinimumChunkSizeOptions { chunk_size: Some(chunk_size) },
         ));

@@ -2,11 +2,11 @@
 // SPDX-License-Identifier: MIT
 //! Character encoding detection, decoding, and encoding streams, ported from
 //! `@datastream/charset`. Charsets are WHATWG labels (via `encoding_rs`);
-//! unknown labels fall back to UTF-8.
+//! a missing charset means UTF-8, an unknown one is an error.
 
 use async_stream::try_stream;
-use datastream_core::{create_pass_through_stream, DataStream, StreamExt, StreamResult};
-use encoding_rs::{CoderResult, Encoding, UTF_16BE, UTF_16LE, UTF_8};
+use datastream_core::{create_pass_through_stream, DataStream, Result, StreamExt, StreamResult};
+use encoding_rs::{CoderResult, EncoderResult, Encoding, REPLACEMENT, UTF_16BE, UTF_16LE, UTF_8};
 use serde_json::json;
 use std::sync::{Arc, Mutex};
 
@@ -27,18 +27,19 @@ pub struct CharsetOptions {
     pub charset: Option<String>,
 }
 
-pub fn get_supported_encoding(charset: &str) -> &str {
-    if charset == "ISO-8859-8-I" {
-        "ISO-8859-8"
-    } else {
-        charset
+/// A missing charset means UTF-8; a given but unknown one is an error, not a
+/// silent UTF-8 fallback that would mis-decode/encode the data. `encoding_rs`
+/// resolves labels itself (including ISO-8859-8-I). Labels that WHATWG maps
+/// to the "replacement" encoding (ISO-2022-KR, HZ-GB-2312, ...) can't be
+/// decoded or encoded, so they are unsupported too.
+fn encoding(charset: Option<&str>, name: &str) -> Result<&'static Encoding> {
+    let Some(label) = charset else {
+        return Ok(UTF_8);
+    };
+    match Encoding::for_label(label.as_bytes()) {
+        Some(encoding) if encoding != REPLACEMENT => Ok(encoding),
+        _ => Err(format!("{name}: Unsupported encoding \"{label}\"").into()),
     }
-}
-
-fn encoding(charset: Option<&str>) -> &'static Encoding {
-    charset
-        .and_then(|c| Encoding::for_label(get_supported_encoding(c).as_bytes()))
-        .unwrap_or(UTF_8)
 }
 
 /// Best guess for `sample`, or `None` when it is empty.
@@ -108,13 +109,15 @@ where
 }
 
 /// Decode byte chunks into strings. Multi-byte sequences split across
-/// chunks are carried over; a truncated tail becomes U+FFFD.
+/// chunks are carried over; a truncated tail becomes U+FFFD. Errors on an
+/// unknown charset.
 pub fn charset_decode_stream(
     mut input: DataStream<Vec<u8>>,
     options: CharsetOptions,
-) -> DataStream<String> {
-    let mut decoder = encoding(options.charset.as_deref()).new_decoder_with_bom_removal();
-    Box::pin(try_stream! {
+) -> Result<DataStream<String>> {
+    let mut decoder =
+        encoding(options.charset.as_deref(), "charsetDecodeStream")?.new_decoder_with_bom_removal();
+    Ok(Box::pin(try_stream! {
         let mut decode = move |bytes: &[u8], last: bool| {
             let mut out = String::with_capacity(decoder.max_utf8_buffer_length(bytes.len()).unwrap_or(0));
             let (result, _, _) = decoder.decode_to_string(bytes, &mut out, last);
@@ -131,29 +134,58 @@ pub fn charset_decode_stream(
         if !out.is_empty() {
             yield out;
         }
-    })
+    }))
 }
 
-/// Encode string chunks into bytes. Unmappable characters become HTML
-/// numeric character references (the WHATWG encoder behaviour).
+/// Encode string chunks into bytes. Unmappable characters become `?`
+/// (iconv-lite's default). Stateful encoders (ISO-2022-JP) carry their state
+/// across chunks and emit the trailing shift back to ASCII at the end.
+/// Errors on an unknown charset.
 pub fn charset_encode_stream(
-    input: DataStream<String>,
+    mut input: DataStream<String>,
     options: CharsetOptions,
-) -> DataStream<Vec<u8>> {
-    let encoding = encoding(options.charset.as_deref());
-    Box::pin(input.filter_map(move |chunk| async move {
-        let bytes: Vec<u8> = match chunk {
-            Err(e) => return Some(Err(e)),
+) -> Result<DataStream<Vec<u8>>> {
+    let encoding = encoding(options.charset.as_deref(), "charsetEncodeStream")?;
+    let mut encoder = encoding.new_encoder();
+    Ok(Box::pin(try_stream! {
+        let mut encode = move |chunk: &str, last: bool| -> Vec<u8> {
             // encoding_rs only encodes UTF-16 as UTF-8 (WHATWG), so do it here.
-            Ok(chunk) if encoding == UTF_16LE => {
-                chunk.encode_utf16().flat_map(u16::to_le_bytes).collect()
+            if encoding == UTF_16LE {
+                return chunk.encode_utf16().flat_map(u16::to_le_bytes).collect();
             }
-            Ok(chunk) if encoding == UTF_16BE => {
-                chunk.encode_utf16().flat_map(u16::to_be_bytes).collect()
+            if encoding == UTF_16BE {
+                return chunk.encode_utf16().flat_map(u16::to_be_bytes).collect();
             }
-            Ok(chunk) => encoding.encode(&chunk).0.into_owned(),
+            let mut out = Vec::new();
+            let mut rest = chunk;
+            loop {
+                // Worst case for what is left; `?` replacements can use up
+                // the slack, so re-reserve whenever the output fills.
+                let need = encoder
+                    .max_buffer_length_from_utf8_without_replacement(rest.len())
+                    .unwrap_or(usize::MAX);
+                out.reserve(need);
+                let (result, read) =
+                    encoder.encode_from_utf8_to_vec_without_replacement(rest, &mut out, last);
+                rest = &rest[read..];
+                match result {
+                    EncoderResult::InputEmpty => return out,
+                    EncoderResult::OutputFull => {}
+                    // The ISO-2022-JP encoder is back in its ASCII state here.
+                    EncoderResult::Unmappable(_) => out.push(b'?'),
+                }
+            }
         };
-        (!bytes.is_empty()).then_some(Ok(bytes))
+        while let Some(chunk) = input.next().await {
+            let out = encode(&chunk?, false);
+            if !out.is_empty() {
+                yield out;
+            }
+        }
+        let out = encode("", true);
+        if !out.is_empty() {
+            yield out;
+        }
     }))
 }
 
@@ -327,147 +359,210 @@ mod tests {
         assert_eq!(r2.get()["charset"], Value::Null);
     }
 
+    async fn encoded(chunks: &[&str], options: CharsetOptions) -> Vec<Vec<u8>> {
+        stream_to_array(
+            charset_encode_stream(strings(chunks), options).unwrap(),
+            None,
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn decoded(chunks: &[&[u8]], options: CharsetOptions) -> String {
+        stream_to_string(charset_decode_stream(bytes(chunks), options).unwrap(), None)
+            .await
+            .unwrap()
+    }
+
     #[tokio::test]
     async fn encode_utf8_by_default() {
-        let output = stream_to_array(
-            charset_encode_stream(strings(&["Hello", " ", "World"]), Default::default()),
-            None,
-        );
         assert_eq!(
-            output.await.unwrap(),
+            encoded(&["Hello", " ", "World"], Default::default()).await,
             [b"Hello".to_vec(), b" ".to_vec(), b"World".to_vec()]
         );
-        let output = stream_to_array(
-            charset_encode_stream(strings(&["Hello"]), charset("UTF-8")),
-            None,
+        assert_eq!(
+            encoded(&["Hello"], charset("UTF-8")).await,
+            [b"Hello".to_vec()]
         );
-        assert_eq!(output.await.unwrap(), [b"Hello".to_vec()]);
+    }
+
+    #[tokio::test]
+    async fn encode_utf8_labels() {
+        for name in ["utf8", "utf-8"] {
+            assert_eq!(encoded(&["Hé"], charset(name)).await, ["Hé".as_bytes()]);
+        }
     }
 
     #[tokio::test]
     async fn encode_empty() {
-        let output =
-            stream_to_array(charset_encode_stream(strings(&[]), charset("UTF-8")), None).await;
-        assert!(output.unwrap().is_empty());
-        let output = stream_to_array(
-            charset_encode_stream(strings(&["", "a", ""]), charset("UTF-8")),
-            None,
-        )
-        .await;
-        assert_eq!(output.unwrap(), [b"a".to_vec()]);
+        assert!(encoded(&[], charset("UTF-8")).await.is_empty());
+        assert_eq!(
+            encoded(&["", "a", ""], charset("UTF-8")).await,
+            [b"a".to_vec()]
+        );
     }
 
     #[tokio::test]
     async fn encode_utf16() {
-        let output = stream_to_array(
-            charset_encode_stream(strings(&["té"]), charset("UTF-16LE")),
-            None,
-        )
-        .await;
-        assert_eq!(output.unwrap(), [vec![b't', 0, 0xE9, 0]]);
-        let output = stream_to_array(
-            charset_encode_stream(strings(&["té"]), charset("UTF-16BE")),
-            None,
-        )
-        .await;
-        assert_eq!(output.unwrap(), [vec![0, b't', 0, 0xE9]]);
+        assert_eq!(
+            encoded(&["té"], charset("UTF-16LE")).await,
+            [vec![b't', 0, 0xE9, 0]]
+        );
+        assert_eq!(
+            encoded(&["té"], charset("UTF-16BE")).await,
+            [vec![0, b't', 0, 0xE9]]
+        );
     }
 
-    #[tokio::test]
-    async fn encode_unsupported_falls_back_to_utf8() {
-        let output = stream_to_array(
-            charset_encode_stream(strings(&["tést"]), charset("unsupported-charset")),
-            None,
-        );
-        assert_eq!(output.await.unwrap(), ["tést".as_bytes().to_vec()]);
+    #[test]
+    fn unsupported_charset_errors() {
+        // Never a silent UTF-8 fallback that would mis-decode/encode the data.
+        for name in ["unsupported-charset", "ISO-2022-KR", "replacement", ""] {
+            let e = charset_encode_stream(strings(&[]), charset(name))
+                .err()
+                .unwrap();
+            assert_eq!(
+                e.to_string(),
+                format!("charsetEncodeStream: Unsupported encoding \"{name}\"")
+            );
+            let e = charset_decode_stream(bytes(&[]), charset(name))
+                .err()
+                .unwrap();
+            assert_eq!(
+                e.to_string(),
+                format!("charsetDecodeStream: Unsupported encoding \"{name}\"")
+            );
+        }
     }
 
     #[tokio::test]
     async fn encode_iso_8859_8_i() {
-        let output = stream_to_array(
-            charset_encode_stream(strings(&["test"]), charset("ISO-8859-8-I")),
-            None,
+        assert_eq!(
+            encoded(&["t\u{5d0}"], charset("ISO-8859-8-I")).await,
+            [vec![0x74, 0xE0]]
         );
-        assert_eq!(output.await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn encode_unmappable_becomes_question_mark() {
+        assert_eq!(
+            encoded(&["a€", "世b"], charset("ISO-8859-2")).await,
+            [b"a?".to_vec(), b"?b".to_vec()]
+        );
+        assert_eq!(
+            encoded(&["x😀y"], charset("Shift_JIS")).await,
+            [b"x?y".to_vec()]
+        );
     }
 
     #[tokio::test]
     async fn encode_stateful_iso_2022_jp_round_trips() {
         let original = "Hello 世界";
         let stream = charset_decode_stream(
-            charset_encode_stream(strings(&[original]), charset("ISO-2022-JP")),
+            charset_encode_stream(strings(&[original]), charset("ISO-2022-JP")).unwrap(),
             charset("ISO-2022-JP"),
-        );
+        )
+        .unwrap();
         assert_eq!(stream_to_string(stream, None).await.unwrap(), original);
     }
 
     #[tokio::test]
+    async fn encode_stateful_flushes_tail() {
+        // The shift back to ASCII is only written once the input ends.
+        let chunks = encoded(&["世", "界"], charset("ISO-2022-JP")).await;
+        assert_eq!(chunks.last().unwrap(), &[0x1B, 0x28, 0x42]);
+        let stream =
+            charset_decode_stream(create_readable_stream(chunks), charset("ISO-2022-JP")).unwrap();
+        assert_eq!(stream_to_string(stream, None).await.unwrap(), "世界");
+        // Unmappable chars mid-sequence leave the encoder in ASCII for the `?`.
+        let chunks = encoded(&["世😀界"], charset("ISO-2022-JP")).await;
+        let stream =
+            charset_decode_stream(create_readable_stream(chunks), charset("ISO-2022-JP")).unwrap();
+        assert_eq!(stream_to_string(stream, None).await.unwrap(), "世?界");
+    }
+
+    #[tokio::test]
     async fn decode_utf8() {
-        let output = stream_to_string(
-            charset_decode_stream(bytes(&[b"Hello", b" ", b"World"]), charset("UTF-8")),
-            None,
+        assert_eq!(
+            decoded(&[b"Hello", b" ", b"World"], charset("UTF-8")).await,
+            "Hello World"
         );
-        assert_eq!(output.await.unwrap(), "Hello World");
-        let output = stream_to_string(
-            charset_decode_stream(bytes(&[b"Test"]), Default::default()),
-            None,
+        assert_eq!(decoded(&[b"Test"], Default::default()).await, "Test");
+    }
+
+    #[tokio::test]
+    async fn decode_utf16le() {
+        assert_eq!(
+            decoded(
+                &[&[b't', 0, b'e', 0, b's', 0, b't', 0]],
+                charset("UTF-16LE")
+            )
+            .await,
+            "test"
         );
-        assert_eq!(output.await.unwrap(), "Test");
     }
 
     #[tokio::test]
     async fn decode_split_multibyte() {
         let full = "测试".as_bytes();
-        let stream = charset_decode_stream(bytes(&[&full[..3], &full[3..]]), charset("UTF-8"));
-        assert_eq!(stream_to_string(stream, None).await.unwrap(), "测试");
+        assert_eq!(
+            decoded(&[&full[..3], &full[3..]], charset("UTF-8")).await,
+            "测试"
+        );
         // Partial sequences don't emit empty chunks.
         let stream = charset_decode_stream(
             bytes(&[&full[..1], &full[1..2], &full[2..]]),
             charset("UTF-8"),
-        );
+        )
+        .unwrap();
         assert_eq!(stream_to_array(stream, None).await.unwrap(), ["测试"]);
     }
 
     #[tokio::test]
     async fn decode_truncated_tail_is_replacement_char() {
-        let stream = charset_decode_stream(bytes(&[&[0xC2]]), charset("UTF-8"));
-        assert_eq!(stream_to_string(stream, None).await.unwrap(), "\u{FFFD}");
+        assert_eq!(decoded(&[&[0xC2]], charset("UTF-8")).await, "\u{FFFD}");
     }
 
     #[tokio::test]
-    async fn decode_unsupported_and_aliases() {
-        for name in ["unsupported-charset", "ISO-8859-8-I"] {
-            let stream = charset_decode_stream(bytes(&[b"test"]), charset(name));
-            assert_eq!(stream_to_string(stream, None).await.unwrap(), "test");
-        }
+    async fn decode_iso_8859_8_i() {
+        // 0xE0 is HEBREW LETTER ALEF in ISO-8859-8 (the -I "logical order"
+        // label shares the same byte mapping).
+        assert_eq!(
+            decoded(&[&[0x74, 0xE0]], charset("ISO-8859-8-I")).await,
+            "t\u{5d0}"
+        );
     }
 
     #[tokio::test]
     async fn decode_empty_chunks() {
-        let stream = charset_decode_stream(bytes(&[b"", b"test"]), charset("UTF-8"));
+        let stream = charset_decode_stream(bytes(&[b"", b"test"]), charset("UTF-8")).unwrap();
         assert_eq!(stream_to_array(stream, None).await.unwrap(), ["test"]);
     }
 
     #[tokio::test]
     async fn decode_preserves_legacy_charset() {
-        let stream = charset_decode_stream(bytes(&[&[0xE9]]), charset("ISO-8859-1"));
-        assert_eq!(stream_to_string(stream, None).await.unwrap(), "é");
-        let stream = charset_decode_stream(bytes(&[&[0xC1]]), charset("KOI8-R"));
-        assert_eq!(stream_to_string(stream, None).await.unwrap(), "\u{430}");
+        assert_eq!(decoded(&[&[0xE9]], charset("ISO-8859-1")).await, "é");
+        assert_eq!(decoded(&[&[0xC1]], charset("KOI8-R")).await, "\u{430}");
     }
 
     #[tokio::test]
     async fn encode_decode_round_trip() {
         let stream = charset_decode_stream(
-            charset_encode_stream(strings(&["Hello", " ", "Wörld"]), charset("windows-1252")),
+            charset_encode_stream(strings(&["Hello", " ", "Wörld"]), charset("windows-1252"))
+                .unwrap(),
             charset("windows-1252"),
-        );
+        )
+        .unwrap();
         assert_eq!(stream_to_string(stream, None).await.unwrap(), "Hello Wörld");
     }
 
-    #[test]
-    fn supported_encoding_aliases() {
-        assert_eq!(get_supported_encoding("ISO-8859-8-I"), "ISO-8859-8");
-        assert_eq!(get_supported_encoding("UTF-8"), "UTF-8");
+    #[tokio::test]
+    async fn none_charset_means_utf8() {
+        let stream = charset_decode_stream(
+            charset_encode_stream(strings(&["héllo"]), Default::default()).unwrap(),
+            Default::default(),
+        )
+        .unwrap();
+        assert_eq!(stream_to_string(stream, None).await.unwrap(), "héllo");
     }
 }

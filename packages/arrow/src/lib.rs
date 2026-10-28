@@ -3,29 +3,31 @@
 //! Apache Arrow record batch transform streams, ported from `@datastream/arrow`.
 //!
 //! Rows are `serde_json::Value` objects or arrays. Supported column types are
-//! Boolean, Int32, Float64, Utf8 and Timestamp(Millisecond) (epoch-ms numbers;
-//! JSON has no `Date`). Reading also accepts the other integer, float and
-//! large-string types.
+//! Boolean, every integer width, Float32/64, Utf8/LargeUtf8, Date32/64 and
+//! Timestamp (any unit or timezone). Dates and timestamps are epoch-ms numbers
+//! (JSON has no `Date`). Schema detection infers Boolean, Int32, Float64 and
+//! Utf8. Batching checks every cell against its column type and errors
+//! (naming the stream, row and field) rather than coercing it.
 
 use std::sync::{Arc, Mutex};
 
 pub use arrow_array;
 use arrow_array::builder::{
-    BooleanBuilder, Float64Builder, Int32Builder, StringBuilder, TimestampMillisecondBuilder,
+    BooleanBuilder, GenericStringBuilder, LargeStringBuilder, PrimitiveBuilder, StringBuilder,
 };
 use arrow_array::cast::AsArray;
 use arrow_array::types::{
-    Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, Int8Type, TimestampMillisecondType,
-    UInt16Type, UInt32Type, UInt64Type, UInt8Type,
+    ArrowPrimitiveType, Date32Type, Date64Type, Float32Type, Float64Type, Int16Type, Int32Type,
+    Int64Type, Int8Type, TimestampMicrosecondType, TimestampMillisecondType,
+    TimestampNanosecondType, TimestampSecondType, UInt16Type, UInt32Type, UInt64Type, UInt8Type,
 };
 pub use arrow_array::RecordBatch;
-use arrow_array::{Array, ArrayRef};
+use arrow_array::{Array, ArrayRef, OffsetSizeTrait};
 pub use arrow_schema;
 use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use async_stream::try_stream;
 use datastream_core::{
-    create_transform_stream, noop_flush, DataStream, Error, Map, Result, StreamExt, StreamResult,
-    Value,
+    create_transform_stream, noop_flush, DataStream, Map, Result, StreamExt, StreamResult, Value,
 };
 use serde_json::json;
 
@@ -48,6 +50,20 @@ fn infer_type(value: Option<&Value>) -> Option<DataType> {
             })
         }
         _ => Some(DataType::Utf8),
+    }
+}
+
+// Widen across every sampled value rather than trusting the first one, so a
+// column that starts with 1 and later holds 2.7 is not rejected by an Int32
+// column. Int32 + Float64 widen to Float64; any other mix falls back to Utf8.
+fn widen(current: DataType, next: DataType) -> DataType {
+    let is_number = |t: &DataType| matches!(t, DataType::Int32 | DataType::Float64);
+    if current == next {
+        current
+    } else if is_number(&current) && is_number(&next) {
+        DataType::Float64
+    } else {
+        DataType::Utf8
     }
 }
 
@@ -113,13 +129,14 @@ impl ArrowDetectSchemaResult {
             .map(|(i, name)| {
                 let data_type = samples
                     .iter()
-                    .find_map(|s| {
+                    .filter_map(|s| {
                         infer_type(if is_array {
                             s.get(i)
                         } else {
                             s.get(name.as_str())
                         })
                     })
+                    .reduce(widen)
                     .unwrap_or(DataType::Utf8);
                 Field::new(name, data_type, true)
             })
@@ -223,109 +240,228 @@ fn resolve_schema(name: &str, schema: Option<&ArrowSchemaInput>) -> Result<Schem
     Ok(schema)
 }
 
-fn mismatch(value: &Value) -> Error {
-    format!("arrow: cannot append {value} to column").into()
-}
-
-// JS numbers like 3.0 are integers too.
+// JS numbers like 3.0 are integers too. Floats outside the i64 range are not
+// (an `as` cast would saturate them silently).
 fn as_int(value: &Value) -> Option<i64> {
+    const I64_BOUND: f64 = 9_223_372_036_854_775_808.0; // 2^63
     value.as_i64().or_else(|| {
         value
             .as_f64()
-            .filter(|f| f.fract() == 0.0)
+            .filter(|f| f.fract() == 0.0 && (-I64_BOUND..I64_BOUND).contains(f))
             .map(|f| f as i64)
     })
 }
 
-enum Column {
-    Boolean(BooleanBuilder),
-    Int32(Int32Builder),
-    Float64(Float64Builder),
-    Utf8(StringBuilder),
-    Timestamp(TimestampMillisecondBuilder),
+// How a rejected value is shown in an error, matching the JS port: strings are
+// quoted, objects/arrays are not dumped, and a missing cell is `undefined`.
+fn describe_value(value: Option<&Value>) -> String {
+    match value {
+        None => "undefined".into(),
+        Some(Value::Object(_)) => "[object Object]".into(),
+        Some(Value::Array(_)) => "[object Array]".into(),
+        Some(other) => other.to_string(),
+    }
+}
+
+const MS_PER_DAY: i64 = 86_400_000;
+
+fn int<N: TryFrom<i64>>(value: &Value) -> Option<N> {
+    as_int(value).and_then(|v| N::try_from(v).ok())
+}
+
+// One column's builder. `push` returns `false` (appending nothing) for a value
+// the column cannot hold.
+trait Cells: Send {
+    fn push(&mut self, value: &Value) -> bool;
+    fn push_null(&mut self);
+    fn build(&mut self) -> ArrayRef;
+}
+
+impl Cells for BooleanBuilder {
+    fn push(&mut self, value: &Value) -> bool {
+        value.as_bool().map(|v| self.append_value(v)).is_some()
+    }
+    fn push_null(&mut self) {
+        self.append_null();
+    }
+    fn build(&mut self) -> ArrayRef {
+        Arc::new(self.finish())
+    }
+}
+
+// Utf8 is unchecked: other values keep their JSON text.
+impl<O: OffsetSizeTrait> Cells for GenericStringBuilder<O> {
+    fn push(&mut self, value: &Value) -> bool {
+        match value {
+            Value::String(s) => self.append_value(s),
+            other => self.append_value(other.to_string()),
+        }
+        true
+    }
+    fn push_null(&mut self) {
+        self.append_null();
+    }
+    fn build(&mut self) -> ArrayRef {
+        Arc::new(self.finish())
+    }
+}
+
+// Numbers, dates and timestamps: `convert` is the column's value check.
+struct Primitive<T: ArrowPrimitiveType> {
+    builder: PrimitiveBuilder<T>,
+    convert: fn(&Value) -> Option<T::Native>,
+}
+
+impl<T: ArrowPrimitiveType> Cells for Primitive<T> {
+    fn push(&mut self, value: &Value) -> bool {
+        (self.convert)(value)
+            .map(|v| self.builder.append_value(v))
+            .is_some()
+    }
+    fn push_null(&mut self) {
+        self.builder.append_null();
+    }
+    fn build(&mut self) -> ArrayRef {
+        Arc::new(self.builder.finish())
+    }
+}
+
+fn primitive<T: ArrowPrimitiveType>(
+    data_type: &DataType,
+    convert: fn(&Value) -> Option<T::Native>,
+) -> Box<dyn Cells> {
+    Box::new(Primitive::<T> {
+        // Keeps a timestamp's timezone.
+        builder: PrimitiveBuilder::new().with_data_type(data_type.clone()),
+        convert,
+    })
+}
+
+struct Column {
+    cells: Box<dyn Cells>,
+    // Only a Utf8 column can hold a real "".
+    utf8: bool,
 }
 
 impl Column {
+    // Dates and timestamps take epoch milliseconds (JSON has no Date), whatever
+    // the column's unit.
     fn new(data_type: &DataType) -> Result<Self> {
-        Ok(match data_type {
-            DataType::Boolean => Self::Boolean(BooleanBuilder::new()),
-            DataType::Int32 => Self::Int32(Int32Builder::new()),
-            DataType::Float64 => Self::Float64(Float64Builder::new()),
-            DataType::Utf8 => Self::Utf8(StringBuilder::new()),
-            DataType::Timestamp(TimeUnit::Millisecond, _) => Self::Timestamp(
-                TimestampMillisecondBuilder::new().with_data_type(data_type.clone()),
-            ),
+        let cells: Box<dyn Cells> = match data_type {
+            DataType::Boolean => Box::new(BooleanBuilder::new()),
+            DataType::Int8 => primitive::<Int8Type>(data_type, int),
+            DataType::Int16 => primitive::<Int16Type>(data_type, int),
+            DataType::Int32 => primitive::<Int32Type>(data_type, int),
+            DataType::Int64 => primitive::<Int64Type>(data_type, as_int),
+            DataType::UInt8 => primitive::<UInt8Type>(data_type, int),
+            DataType::UInt16 => primitive::<UInt16Type>(data_type, int),
+            DataType::UInt32 => primitive::<UInt32Type>(data_type, int),
+            DataType::UInt64 => {
+                primitive::<UInt64Type>(data_type, |v| v.as_u64().or_else(|| int(v)))
+            }
+            DataType::Float32 => {
+                primitive::<Float32Type>(data_type, |v| v.as_f64().map(|f| f as f32))
+            }
+            DataType::Float64 => primitive::<Float64Type>(data_type, Value::as_f64),
+            DataType::Date32 => primitive::<Date32Type>(data_type, |v| {
+                as_int(v).and_then(|ms| i32::try_from(ms.div_euclid(MS_PER_DAY)).ok())
+            }),
+            DataType::Date64 => primitive::<Date64Type>(data_type, as_int),
+            DataType::Timestamp(TimeUnit::Second, _) => {
+                primitive::<TimestampSecondType>(data_type, |v| {
+                    as_int(v).map(|ms| ms.div_euclid(1000))
+                })
+            }
+            DataType::Timestamp(TimeUnit::Millisecond, _) => {
+                primitive::<TimestampMillisecondType>(data_type, as_int)
+            }
+            DataType::Timestamp(TimeUnit::Microsecond, _) => {
+                primitive::<TimestampMicrosecondType>(data_type, |v| as_int(v)?.checked_mul(1000))
+            }
+            DataType::Timestamp(TimeUnit::Nanosecond, _) => {
+                primitive::<TimestampNanosecondType>(data_type, |v| {
+                    as_int(v)?.checked_mul(1_000_000)
+                })
+            }
+            DataType::Utf8 => Box::new(StringBuilder::new()),
+            DataType::LargeUtf8 => Box::new(LargeStringBuilder::new()),
             other => return Err(format!("arrow: unsupported column type {other}").into()),
-        })
+        };
+        let utf8 = matches!(data_type, DataType::Utf8 | DataType::LargeUtf8);
+        Ok(Self { cells, utf8 })
     }
 
-    fn append(&mut self, value: Option<&Value>) -> Result<()> {
-        let Some(value) = value.filter(|v| !v.is_null()) else {
-            match self {
-                Self::Boolean(b) => b.append_null(),
-                Self::Int32(b) => b.append_null(),
-                Self::Float64(b) => b.append_null(),
-                Self::Utf8(b) => b.append_null(),
-                Self::Timestamp(b) => b.append_null(),
-            }
-            return Ok(());
-        };
-        match self {
-            Self::Boolean(b) => b.append_value(value.as_bool().ok_or_else(|| mismatch(value))?),
-            Self::Int32(b) => {
-                let int = as_int(value).and_then(|v| i32::try_from(v).ok());
-                b.append_value(int.ok_or_else(|| mismatch(value))?);
-            }
-            Self::Float64(b) => b.append_value(value.as_f64().ok_or_else(|| mismatch(value))?),
-            Self::Utf8(b) => match value {
-                Value::String(s) => b.append_value(s),
-                other => b.append_value(other.to_string()),
-            },
-            Self::Timestamp(b) => b.append_value(as_int(value).ok_or_else(|| mismatch(value))?),
+    /// Append one cell, returning `false` (and appending nothing) for a value
+    /// the column cannot hold or a null in a non-nullable field. Detection
+    /// treats "" as null, so an empty cell is null in every column but Utf8,
+    /// the only one that can hold a real "".
+    fn append(&mut self, value: Option<&Value>, nullable: bool) -> bool {
+        match value {
+            None | Some(Value::Null) => {}
+            Some(Value::String(s)) if s.is_empty() && !self.utf8 => {}
+            Some(value) => return self.cells.push(value),
         }
-        Ok(())
+        if nullable {
+            self.cells.push_null();
+        }
+        nullable
     }
 
     fn finish(&mut self) -> ArrayRef {
-        match self {
-            Self::Boolean(b) => Arc::new(b.finish()),
-            Self::Int32(b) => Arc::new(b.finish()),
-            Self::Float64(b) => Arc::new(b.finish()),
-            Self::Utf8(b) => Arc::new(b.finish()),
-            Self::Timestamp(b) => Arc::new(b.finish()),
-        }
+        self.cells.build()
     }
 }
 
 struct Batcher {
+    name: &'static str,
     schema: SchemaRef,
     columns: Vec<Column>,
     rows: usize,
+    // Zero-based index of the row across the whole stream, for error messages.
+    row_index: usize,
 }
 
 impl Batcher {
-    fn new(schema: SchemaRef) -> Result<Self> {
+    fn new(name: &'static str, schema: SchemaRef) -> Result<Self> {
         let columns: Vec<Column> = schema
             .fields()
             .iter()
             .map(|f| Column::new(f.data_type()))
             .collect::<Result<_>>()?;
         Ok(Self {
+            name,
             schema,
             columns,
             rows: 0,
+            row_index: 0,
         })
     }
 
+    // Each cell is checked against its column type: a schema inferred from the
+    // first sample_size rows must reject, not coerce, a later row that does
+    // not fit it. The error names the stream, row and field.
     fn push(&mut self, row: &Value, is_array: bool) -> Result<()> {
         let fields = self.schema.fields();
         for (i, (field, column)) in fields.iter().zip(&mut self.columns).enumerate() {
-            column.append(if is_array {
+            let value = if is_array {
                 row.get(i)
             } else {
                 row.get(field.name().as_str())
-            })?;
+            };
+            if !column.append(value, field.is_nullable()) {
+                return Err(format!(
+                    "{}: row {}, field \"{}\" expects {}{}, got {}",
+                    self.name,
+                    self.row_index,
+                    field.name(),
+                    if field.is_nullable() { "" } else { "non-null " },
+                    field.data_type(),
+                    describe_value(value)
+                )
+                .into());
+            }
         }
+        self.row_index += 1;
         self.rows += 1;
         Ok(())
     }
@@ -354,7 +490,7 @@ fn batch_stream(
         while let Some(row) = input.next().await {
             let row = row?;
             if batcher.is_none() {
-                batcher = Some(Batcher::new(resolve_schema(name, schema.as_ref())?)?);
+                batcher = Some(Batcher::new(name, resolve_schema(name, schema.as_ref())?)?);
             }
             let b = batcher.as_mut().expect("batcher initialized above");
             b.push(&row, is_array)?;
@@ -365,7 +501,7 @@ fn batch_stream(
         // Resolve even for an empty stream so a missing lazy schema still errors.
         let mut b = match batcher {
             Some(b) => b,
-            None => Batcher::new(resolve_schema(name, schema.as_ref())?)?,
+            None => Batcher::new(name, resolve_schema(name, schema.as_ref())?)?,
         };
         if b.rows > 0 {
             yield b.finish()?;
@@ -409,9 +545,32 @@ fn cell(column: &ArrayRef, r: usize) -> Result<Value> {
         DataType::Float64 => Value::from(column.as_primitive::<Float64Type>().value(r)),
         DataType::Utf8 => Value::from(column.as_string::<i32>().value(r)),
         DataType::LargeUtf8 => Value::from(column.as_string::<i64>().value(r)),
+        DataType::Date32 => {
+            Value::from(i64::from(column.as_primitive::<Date32Type>().value(r)) * MS_PER_DAY)
+        }
+        DataType::Date64 => Value::from(column.as_primitive::<Date64Type>().value(r)),
+        // Epoch milliseconds whatever the unit (sub-ms precision floors).
+        DataType::Timestamp(TimeUnit::Second, _) => Value::from(
+            column
+                .as_primitive::<TimestampSecondType>()
+                .value(r)
+                .saturating_mul(1000),
+        ),
         DataType::Timestamp(TimeUnit::Millisecond, _) => {
             Value::from(column.as_primitive::<TimestampMillisecondType>().value(r))
         }
+        DataType::Timestamp(TimeUnit::Microsecond, _) => Value::from(
+            column
+                .as_primitive::<TimestampMicrosecondType>()
+                .value(r)
+                .div_euclid(1000),
+        ),
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => Value::from(
+            column
+                .as_primitive::<TimestampNanosecondType>()
+                .value(r)
+                .div_euclid(1_000_000),
+        ),
         other => return Err(format!("arrow: unsupported column type {other}").into()),
     })
 }
@@ -552,11 +711,10 @@ mod tests {
         let rows = vec![
             json!({"flag": false, "a": null, "b": "", "c": "", "d": null}),
             json!({"flag": true, "a": 42, "b": "hello", "c": 42, "d": null}),
-            json!({"a": "later", "c": "later"}),
         ];
         let (_, detected) = detect(rows, 10).await;
         use DataType::{Boolean, Int32, Utf8};
-        // First non-empty value wins; all-null falls back to Utf8.
+        // Null and "" are skipped; all-null falls back to Utf8.
         assert_eq!(types(&detected), [Boolean, Int32, Utf8, Int32, Utf8]);
         assert!(detected
             .schema()
@@ -601,6 +759,23 @@ mod tests {
         assert_eq!(fields(&detected), json!(["column0", "column1", "column2"]));
         let (_, detected) = detect(vec![json!([1, 2, 3]), json!([4])], 10).await;
         assert_eq!(fields(&detected), json!(["column0", "column1", "column2"]));
+    }
+
+    // Widening across all samples (order-independent); each column pins one rule.
+    #[tokio::test]
+    async fn detect_widens_mixed_types_across_samples() {
+        let rows = vec![
+            json!({"intStr": 42, "strInt": "hello", "floatInt": 2.7, "boolInt": true, "intInt": 1}),
+            json!({"intStr": "hello", "strInt": 42, "floatInt": 1, "boolInt": 1, "intInt": null}),
+            json!({"intStr": null, "strInt": null, "floatInt": null, "boolInt": null, "intInt": 2}),
+        ];
+        let (_, detected) = detect(rows, 10).await;
+        use DataType::{Float64, Int32, Utf8};
+        assert_eq!(types(&detected), [Utf8, Utf8, Float64, Utf8, Int32]);
+        // A column that starts with 1 and later holds 2.7 keeps 2.7.
+        let output = round_trip(vec![json!({"a": 1}), json!({"a": 2.7})], 10).await;
+        let a: Vec<Option<f64>> = output.iter().map(|row| row["a"].as_f64()).collect();
+        assert_eq!(a, [Some(1.0), Some(2.7)]);
     }
 
     #[tokio::test]
@@ -698,7 +873,190 @@ mod tests {
         )
         .unwrap();
         let e = stream_to_array(stream, None).await.unwrap_err();
-        assert_eq!(e.to_string(), "arrow: cannot append \"x\" to column");
+        assert_eq!(
+            e.to_string(),
+            "arrowBatchFromObjectStream: row 0, field \"id\" expects Int32, got \"x\""
+        );
+    }
+
+    // *** values validated against the sealed schema type *** //
+    // A row that does not fit the schema inferred from the first sample_size
+    // rows must error (naming stream, row and field), not be coerced.
+    #[tokio::test]
+    async fn detect_then_batch_rejects_later_int32_overflow() {
+        let options = ArrowDetectSchemaOptions {
+            sample_size: Some(2),
+            ..Default::default()
+        };
+        let rows = vec![
+            json!({"id": 1}),
+            json!({"id": 2}),
+            json!({"id": 3_000_000_000u64}),
+        ];
+        let (stream, detected) = arrow_detect_schema_stream(create_readable_stream(rows), options);
+        let batches =
+            arrow_batch_from_object_stream(stream, opts(detected.lazy_schema(), 10)).unwrap();
+        let e = stream_to_array(batches, None).await.unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "arrowBatchFromObjectStream: row 2, field \"id\" expects Int32, got 3000000000"
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_from_array_names_stream_row_and_column_of_bad_value() {
+        let schema = Schema::new(vec![Field::new("column0", DataType::Int32, true)]);
+        let rows = vec![json!([1]), json!([2]), json!([2.7])];
+        let stream =
+            arrow_batch_from_array_stream(create_readable_stream(rows), opts(schema, 1)).unwrap();
+        let e = stream_to_array(stream, None).await.unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "arrowBatchFromArrayStream: row 2, field \"column0\" expects Int32, got 2.7"
+        );
+    }
+
+    fn timestamp_ms() -> DataType {
+        DataType::Timestamp(TimeUnit::Millisecond, None)
+    }
+
+    // One object row {v: value} through batch -> rows; Ok(v) or the error text.
+    async fn batch_one(data_type: DataType, value: Option<Value>, nullable: bool) -> Result<Value> {
+        let schema = Schema::new(vec![Field::new("v", data_type, nullable)]);
+        let mut row = Map::new();
+        if let Some(value) = value {
+            row.insert("v".into(), value);
+        }
+        let batches = arrow_batch_from_object_stream(
+            create_readable_stream([Value::Object(row)]),
+            opts(schema, 10),
+        )?;
+        let rows = stream_to_array(arrow_to_object_stream(batches), None).await?;
+        Ok(rows[0]["v"].clone())
+    }
+
+    const PREFIX: &str = "arrowBatchFromObjectStream: row 0, field \"v\" expects";
+
+    #[tokio::test]
+    async fn batch_accepts_values_that_fit_their_column_type() {
+        let cases = [
+            (DataType::Int8, json!(127), json!(127)),
+            (DataType::Int8, json!(-128), json!(-128)),
+            (DataType::UInt8, json!(0), json!(0)),
+            (DataType::UInt8, json!(255), json!(255)),
+            (DataType::Int32, json!(2_147_483_647), json!(2_147_483_647)),
+            (
+                DataType::Int32,
+                json!(-2_147_483_648i64),
+                json!(-2_147_483_648i64),
+            ),
+            (DataType::Int32, json!(3.0), json!(3)),
+            (
+                DataType::UInt32,
+                json!(3_000_000_000u64),
+                json!(3_000_000_000u64),
+            ),
+            (DataType::Int64, json!(5), json!(5)),
+            (DataType::UInt64, json!(u64::MAX), json!(u64::MAX)),
+            (DataType::Float32, json!(1.5), json!(1.5)),
+            (DataType::Float64, json!(2.7), json!(2.7)),
+            (DataType::Boolean, json!(false), json!(false)),
+            (timestamp_ms(), json!(2_000), json!(2_000)),
+            // Utf8 is unchecked: non-strings keep their JSON text.
+            (DataType::Utf8, json!(5), json!("5")),
+        ];
+        for (data_type, value, expected) in cases {
+            let label = format!("{data_type} {value}");
+            assert_eq!(
+                batch_one(data_type, Some(value), true).await.unwrap(),
+                expected,
+                "{label}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_rejects_values_that_do_not_fit_their_column_type() {
+        let ts = timestamp_ms().to_string();
+        let cases = [
+            (DataType::Int8, json!(128), "Int8, got 128".to_string()),
+            (DataType::Int8, json!(-129), "Int8, got -129".into()),
+            (DataType::UInt8, json!(256), "UInt8, got 256".into()),
+            (DataType::UInt8, json!(-1), "UInt8, got -1".into()),
+            (DataType::Int64, json!(1.5), "Int64, got 1.5".into()),
+            (DataType::Float32, json!("1"), "Float32, got \"1\"".into()),
+            (
+                DataType::Int32,
+                json!(2_147_483_648u64),
+                "Int32, got 2147483648".into(),
+            ),
+            (
+                DataType::Int32,
+                json!(-2_147_483_649i64),
+                "Int32, got -2147483649".into(),
+            ),
+            (DataType::Int32, json!(1e300), "Int32, got 1e+300".into()),
+            (DataType::Int32, json!("oops"), "Int32, got \"oops\"".into()),
+            (DataType::Int32, json!(true), "Int32, got true".into()),
+            (
+                DataType::Int32,
+                json!({}),
+                "Int32, got [object Object]".into(),
+            ),
+            (
+                DataType::Int32,
+                json!([1]),
+                "Int32, got [object Array]".into(),
+            ),
+            (DataType::Float64, json!("1"), "Float64, got \"1\"".into()),
+            (DataType::Boolean, json!(1), "Boolean, got 1".into()),
+            (timestamp_ms(), json!(1.5), format!("{ts}, got 1.5")),
+            (timestamp_ms(), json!(1e300), format!("{ts}, got 1e+300")),
+        ];
+        for (data_type, value, message) in cases {
+            let e = batch_one(data_type, Some(value), true).await.unwrap_err();
+            assert_eq!(e.to_string(), format!("{PREFIX} {message}"));
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_allows_nulls_only_in_nullable_fields() {
+        for value in [Some(Value::Null), None, Some(json!(""))] {
+            let v = batch_one(DataType::Int32, value, true).await.unwrap();
+            assert_eq!(v, Value::Null);
+        }
+        assert_eq!(
+            batch_one(DataType::Utf8, Some(json!("")), true)
+                .await
+                .unwrap(),
+            ""
+        );
+        assert_eq!(
+            batch_one(DataType::Utf8, Some(json!("")), false)
+                .await
+                .unwrap(),
+            ""
+        );
+        assert_eq!(
+            batch_one(DataType::Int32, Some(json!(1)), false)
+                .await
+                .unwrap(),
+            1
+        );
+        let cases = [
+            (
+                DataType::Int32,
+                Some(Value::Null),
+                "non-null Int32, got null",
+            ),
+            (DataType::Int32, None, "non-null Int32, got undefined"),
+            (DataType::Int32, Some(json!("")), "non-null Int32, got \"\""),
+            (DataType::Utf8, Some(Value::Null), "non-null Utf8, got null"),
+        ];
+        for (data_type, value, message) in cases {
+            let e = batch_one(data_type, value, false).await.unwrap_err();
+            assert_eq!(e.to_string(), format!("{PREFIX} {message}"));
+        }
     }
 
     #[test]
@@ -836,6 +1194,51 @@ mod tests {
                 .unwrap(),
             rows
         );
+    }
+
+    // Dates and timestamps read and write epoch milliseconds in every unit.
+    #[tokio::test]
+    async fn date_and_timestamp_units_round_trip_epoch_ms() {
+        let tz = DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into()));
+        let cases = [
+            (DataType::Date32, -43_200_000, -86_400_000),
+            (DataType::Date64, 1_000, 1_000),
+            (DataType::Timestamp(TimeUnit::Second, None), 1_999, 1_000),
+            (DataType::Timestamp(TimeUnit::Microsecond, None), -1, -1),
+            (
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                1_500,
+                1_500,
+            ),
+            (tz, 7, 7),
+        ];
+        for (data_type, value, expected) in cases {
+            let label = format!("{data_type} {value}");
+            let v = batch_one(data_type, Some(json!(value)), true).await;
+            assert_eq!(v.unwrap(), json!(expected), "{label}");
+        }
+        // Past the nanosecond range: rejected, not wrapped.
+        let ns = DataType::Timestamp(TimeUnit::Nanosecond, None);
+        let e = batch_one(ns.clone(), Some(json!(i64::MAX)), true)
+            .await
+            .unwrap_err();
+        assert_eq!(e.to_string(), format!("{PREFIX} {ns}, got {}", i64::MAX));
+    }
+
+    #[tokio::test]
+    async fn large_utf8_columns_keep_empty_strings() {
+        for (value, expected) in [(json!(""), json!("")), (json!(5), json!("5"))] {
+            let v = batch_one(DataType::LargeUtf8, Some(value), false).await;
+            assert_eq!(v.unwrap(), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_rejects_unsupported_column_types() {
+        let e = batch_one(DataType::Binary, Some(json!("x")), true)
+            .await
+            .unwrap_err();
+        assert_eq!(e.to_string(), "arrow: unsupported column type Binary");
     }
 
     #[tokio::test]

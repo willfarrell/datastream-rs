@@ -2,18 +2,26 @@
 // SPDX-License-Identifier: MIT
 //! [`Kafka`] backed by `rdkafka`.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use datastream_core::{CancellationToken, Result};
 use futures::future::{try_join_all, BoxFuture};
+use rdkafka::client::ClientContext;
 use rdkafka::config::ClientConfig;
-use rdkafka::consumer::{Consumer, StreamConsumer};
+use rdkafka::consumer::{
+    BaseConsumer, CommitMode, Consumer, ConsumerContext, Rebalance, StreamConsumer,
+};
 use rdkafka::message::{BorrowedMessage, Header, Headers, Message, OwnedHeaders};
 use rdkafka::producer::{FutureProducer, FutureRecord, Producer};
+use rdkafka::topic_partition_list::{Offset, TopicPartitionList};
 use rdkafka::util::Timeout;
 
-use crate::{ConsumerMessage, EachMessage, Kafka, KafkaConsumer, KafkaProducer, ProducerMessage};
+use crate::{
+    ConsumerMessage, EachMessage, Kafka, KafkaConsumer, KafkaProducer, ProducerMessage,
+    TopicPartitionOffset,
+};
 
 const FLUSH_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -27,7 +35,11 @@ impl Kafka for RdKafka {
         Ok(producer)
     }
     fn consumer(&self, group_id: &str) -> Result<Arc<dyn KafkaConsumer>> {
-        let consumer: StreamConsumer = self.0.clone().set("group.id", group_id).create()?;
+        let consumer = self
+            .0
+            .clone()
+            .set("group.id", group_id)
+            .create_with_context(GroupContext::default())?;
         let consumer: Arc<dyn KafkaConsumer> = Arc::new(RdKafkaConsumer {
             consumer,
             stop: CancellationToken::new(),
@@ -93,8 +105,24 @@ impl KafkaProducer for RdKafkaProducer {
     }
 }
 
+/// Counts partition assignments, for [`KafkaConsumer::group_generation`].
+#[derive(Default)]
+pub struct GroupContext {
+    generation: AtomicU64,
+}
+
+impl ClientContext for GroupContext {}
+
+impl ConsumerContext for GroupContext {
+    fn post_rebalance(&self, _consumer: &BaseConsumer<Self>, rebalance: &Rebalance<'_>) {
+        if let Rebalance::Assign(_) = rebalance {
+            self.generation.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+}
+
 pub struct RdKafkaConsumer {
-    pub consumer: StreamConsumer,
+    pub consumer: StreamConsumer<GroupContext>,
     stop: CancellationToken,
 }
 
@@ -113,6 +141,21 @@ impl RdKafkaConsumer {
             };
             each_message(message).await;
         }
+    }
+
+    async fn commit_all(&self, offsets: &[TopicPartitionOffset]) -> Result<()> {
+        let mut list = TopicPartitionList::new();
+        for position in offsets {
+            list.add_partition_offset(
+                &position.topic,
+                position.partition,
+                Offset::Offset(position.offset),
+            )?;
+        }
+        // Async: librdkafka sends it in the background (and flushes it when
+        // the consumer closes) rather than blocking this thread on the broker.
+        self.consumer.commit(&list, CommitMode::Async)?;
+        Ok(())
     }
 }
 
@@ -133,6 +176,15 @@ impl KafkaConsumer for RdKafkaConsumer {
     fn stop(&self) -> BoxFuture<'_, Result<()>> {
         self.stop.cancel();
         Box::pin(async { Ok(()) })
+    }
+    fn commit_offsets<'a>(
+        &'a self,
+        offsets: &'a [TopicPartitionOffset],
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(self.commit_all(offsets))
+    }
+    fn group_generation(&self) -> u64 {
+        self.consumer.context().generation.load(Ordering::SeqCst)
     }
 }
 

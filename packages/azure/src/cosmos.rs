@@ -3,22 +3,49 @@
 //! Cosmos DB query, upsert and delete streams. Throttled (429) requests are
 //! retried by the SDK itself.
 
+use async_stream::try_stream;
 use azure_data_cosmos::models::PartitionKeyValue;
-use azure_data_cosmos::options::QueryOptions;
+use azure_data_cosmos::options::{
+    ItemWriteOptions, OperationOptionsBuilder, QueryOptions, ThrottlingRetryOptionsBuilder,
+};
 use azure_data_cosmos::{ContainerClient, FeedScope, PartitionKey, Query};
-use datastream_core::{CancellationToken, DataStream, Result, TryStreamExt, Value};
+use datastream_core::{
+    CancellationToken, DataStream, Error, Result, StreamExt, TryStreamExt, Value,
+};
 
 use crate::client::send;
 
-/// Stream every item a query returns, across pages.
+/// Stream every item a query returns, across pages. `signal` aborts the
+/// in-flight page request.
 pub async fn azure_cosmos_query_stream(
     client: &ContainerClient,
     query: impl Into<Query>,
     scope: FeedScope,
     options: Option<QueryOptions>,
+    signal: Option<CancellationToken>,
 ) -> Result<DataStream<Value>> {
-    let items = client.query_items::<Value>(query, scope, options).await?;
-    Ok(Box::pin(items.map_err(Into::into)))
+    let items = send(
+        client.query_items::<Value>(query, scope, options),
+        signal.as_ref(),
+    )
+    .await?;
+    Ok(abortable(items, signal))
+}
+
+fn abortable<T, E>(
+    items: impl futures::Stream<Item = std::result::Result<T, E>> + Send + 'static,
+    signal: Option<CancellationToken>,
+) -> DataStream<T>
+where
+    T: Send + 'static,
+    E: Into<Error>,
+{
+    Box::pin(try_stream! {
+        let mut items = Box::pin(items);
+        while let Some(item) = send(async { items.next().await.transpose() }, signal.as_ref()).await? {
+            yield item;
+        }
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -28,7 +55,22 @@ pub struct AzureCosmosWriteOptions {
     pub partition_key_paths: Vec<String>,
     /// Requests in flight at once (default 1).
     pub concurrency: Option<usize>,
+    /// Retries of a throttled (429) request (default: the SDK's, 9 retries
+    /// within 30s of waiting).
+    pub retry_max_count: Option<u32>,
     pub signal: Option<CancellationToken>,
+}
+
+impl AzureCosmosWriteOptions {
+    fn item_options(&self) -> Option<ItemWriteOptions> {
+        let throttling = ThrottlingRetryOptionsBuilder::new()
+            .with_max_retry_count(self.retry_max_count?)
+            .build();
+        let operation = OperationOptionsBuilder::new()
+            .with_throttling_retry_options(throttling)
+            .build();
+        Some(ItemWriteOptions::default().with_operation_options(operation))
+    }
 }
 
 /// Upsert each item; its id is the item's `id` field.
@@ -43,7 +85,7 @@ pub async fn azure_cosmos_upsert_item_stream(
         .try_for_each_concurrent(concurrency, |item| async move {
             let (key, id) = item_key(&item, &options.partition_key_paths)?;
             send(
-                client.upsert_item(key, &id, &item, None),
+                client.upsert_item(key, &id, &item, options.item_options()),
                 options.signal.as_ref(),
             )
             .await?;
@@ -63,7 +105,11 @@ pub async fn azure_cosmos_delete_item_stream(
     input
         .try_for_each_concurrent(concurrency, |item| async move {
             let (key, id) = item_key(&item, &options.partition_key_paths)?;
-            send(client.delete_item(key, &id, None), options.signal.as_ref()).await?;
+            send(
+                client.delete_item(key, &id, options.item_options()),
+                options.signal.as_ref(),
+            )
+            .await?;
             Ok(())
         })
         .await
@@ -95,6 +141,44 @@ mod tests {
 
     fn paths(paths: &[&str]) -> Vec<String> {
         paths.iter().map(|p| p.to_string()).collect()
+    }
+
+    fn write_options(retry_max_count: Option<u32>) -> AzureCosmosWriteOptions {
+        AzureCosmosWriteOptions {
+            partition_key_paths: paths(&["/pk"]),
+            concurrency: None,
+            retry_max_count,
+            signal: None,
+        }
+    }
+
+    #[test]
+    fn item_options_sets_throttle_retries() {
+        assert!(write_options(None).item_options().is_none());
+        let options = write_options(Some(3)).item_options().unwrap();
+        let throttling = options.operation.throttling_retry_options.unwrap();
+        assert_eq!(throttling.max_retry_count, Some(3));
+        assert_eq!(throttling.max_retry_wait_time, None);
+    }
+
+    #[tokio::test]
+    async fn query_pages_stream_items() {
+        let items = futures::stream::iter([Ok::<_, Error>(json!(1)), Ok(json!(2))]);
+        let out: Vec<_> = abortable(items, None).try_collect().await.unwrap();
+        assert_eq!(out, [json!(1), json!(2)]);
+    }
+
+    #[tokio::test]
+    async fn query_aborts_on_signal() {
+        let signal = CancellationToken::new();
+        signal.cancel();
+        let items = futures::stream::pending::<Result<Value>>();
+        let e = abortable(items, Some(signal))
+            .next()
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(e.to_string(), "Aborted");
     }
 
     #[test]

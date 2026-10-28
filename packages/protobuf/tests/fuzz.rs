@@ -53,10 +53,10 @@ async fn encode(input: Vec<Value>) -> Vec<Vec<u8>> {
     stream_to_array(stream, None).await.unwrap()
 }
 
-async fn decode(input: Vec<Vec<u8>>, max_output_size: Option<usize>) -> Result<Vec<Value>> {
+async fn decode(input: Vec<Vec<u8>>, max_message_size: Option<usize>) -> Result<Vec<Value>> {
     let options = ProtobufDecodeOptions {
         type_: msg_type().into(),
-        max_output_size,
+        max_message_size,
     };
     stream_to_array(
         protobuf_decode_stream(create_readable_stream(input), options),
@@ -114,7 +114,7 @@ proptest! {
     }
 
     #[test]
-    fn fuzz_decode_max_output_size(
+    fn fuzz_decode_max_message_size(
         input in prop::collection::vec((any::<i32>(), ".{0,32}"), 1..16),
         max in 0usize..512,
     ) {
@@ -123,12 +123,13 @@ proptest! {
             .map(|(id, name)| json!({"id": id, "name": name}))
             .collect();
         let encoded = block_on(encode(objects));
-        let total: usize = encoded.iter().map(Vec::len).sum();
+        // The ceiling applies to each message, never the running total.
+        let largest = encoded.iter().map(Vec::len).max().unwrap();
         match block_on(decode(encoded, Some(max))) {
-            Ok(_) => prop_assert!(total <= max),
+            Ok(_) => prop_assert!(largest <= max),
             Err(e) => {
-                prop_assert!(total > max);
-                prop_assert!(e.to_string().contains("maxOutputSize"));
+                prop_assert!(largest > max);
+                prop_assert!(e.to_string().contains("maxMessageSize"));
             }
         }
     }

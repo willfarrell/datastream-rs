@@ -8,13 +8,18 @@ use aws_sdk_sns::operation::publish_batch::builders::PublishBatchFluentBuilder;
 use aws_sdk_sns::types::PublishBatchRequestEntry;
 use datastream_core::{DataStream, Error, Result};
 
-use crate::client::{batch_write, cause_error, send, AwsWriteOptions, Batcher, Retry};
+use crate::client::{
+    batch_write, cause_error, describe_list, send, AwsWriteOptions, Batcher, Retry, Sent,
+};
 
 // PublishBatch: <=10 entries, <=256KiB aggregate payload.
 const SNS_MAX_ENTRIES: usize = 10;
 const SNS_MAX_BATCH_BYTES: usize = 256 * 1024;
 
-/// Publish entries with PublishBatch, retrying the `Failed` subset.
+/// Publish entries with PublishBatch, retrying the `Failed` subset (except
+/// `SenderFault` entries, which retrying cannot fix). On an input error or
+/// abort, entries still buffered come back as
+/// [`AwsUnsentError`](crate::AwsUnsentError) (not sent).
 pub async fn aws_sns_publish_message_stream(
     input: DataStream<PublishBatchRequestEntry>,
     request: PublishBatchFluentBuilder,
@@ -38,6 +43,7 @@ pub async fn aws_sns_publish_message_stream(
         max_count: options.retry_max_count.unwrap_or(10),
         signal: options.signal,
         message: "awsSNSPublishBatch has failed entries",
+        describe: describe_list,
     };
     batch_write(input, batcher, retry, move |entries| {
         let request = request
@@ -46,13 +52,23 @@ pub async fn aws_sns_publish_message_stream(
         let signal = signal.clone();
         async move {
             let output = send(request.send(), signal.as_ref()).await?;
-            let failed: HashSet<&str> = output.failed().iter().map(|e| e.id()).collect();
-            let cause = format!("{:?}", output.failed());
-            let entries = entries
+            // SenderFault marks a permanent (caller-side) failure: set it aside
+            // and only retry the rest.
+            let mut sent = Sent::ok();
+            let mut retry = HashSet::new();
+            for failure in output.failed() {
+                if failure.sender_fault() {
+                    sent.permanent.push(format!("{failure:?}"));
+                } else {
+                    retry.insert(failure.id());
+                    sent.failed.push(format!("{failure:?}"));
+                }
+            }
+            sent.retry = entries
                 .into_iter()
-                .filter(|e| failed.contains(e.id()))
+                .filter(|e| retry.contains(e.id()))
                 .collect();
-            Ok::<_, Error>((entries, cause))
+            Ok::<_, Error>(sent)
         }
     })
     .await
@@ -89,14 +105,20 @@ mod tests {
             .unwrap()
     }
 
+    // A `!` prefix marks a SenderFault (permanent) failure.
     fn output(failed: &[&str]) -> PublishBatchOutput {
         let failed = failed
             .iter()
             .map(|id| {
+                let permanent = id.strip_prefix('!');
                 BatchResultErrorEntry::builder()
-                    .id(*id)
-                    .code("Throttled")
-                    .sender_fault(false)
+                    .id(permanent.unwrap_or(id))
+                    .code(if permanent.is_some() {
+                        "InvalidParameter"
+                    } else {
+                        "Throttled"
+                    })
+                    .sender_fault(permanent.is_some())
                     .build()
                     .unwrap()
             })
@@ -187,6 +209,92 @@ mod tests {
         let cause = &e.downcast_ref::<crate::CauseError>().unwrap().cause;
         assert!(cause.contains("Throttled"), "{cause}");
         assert_eq!(calls.lock().unwrap().len(), 2);
+    }
+
+    // SenderFault entries are set aside (never retried) while retryable
+    // failures in the same batch back off; the error then names every entry
+    // that did not get through.
+    #[tokio::test(start_paused = true)]
+    async fn retries_retryable_alongside_sender_fault_then_throws() {
+        let (client, calls) = recording_client(vec![vec!["a", "!b"]]);
+        let options = AwsWriteOptions {
+            retry_max_count: Some(1),
+            ..Default::default()
+        };
+        let input = vec![entry("a", "1"), entry("b", "2")];
+        let e = publish(&client, input, options).await.unwrap_err();
+        assert_eq!(e.to_string(), "awsSNSPublishBatch has failed entries");
+        let cause = &e.downcast_ref::<crate::CauseError>().unwrap().cause;
+        assert!(cause.contains("InvalidParameter"), "{cause}");
+        assert!(!cause.contains("Throttled"), "{cause}");
+        assert_eq!(*calls.lock().unwrap(), [vec!["a", "b"], vec!["a"]]);
+
+        // Still failing once retries run out: both are in the cause.
+        let (client, calls) = recording_client(vec![vec!["a", "!b"], vec!["a"]]);
+        let options = AwsWriteOptions {
+            retry_max_count: Some(1),
+            ..Default::default()
+        };
+        let input = vec![entry("a", "1"), entry("b", "2")];
+        let e = publish(&client, input, options).await.unwrap_err();
+        let cause = &e.downcast_ref::<crate::CauseError>().unwrap().cause;
+        let permanent = cause.find("InvalidParameter").unwrap();
+        assert!(permanent < cause.find("Throttled").unwrap(), "{cause}");
+        assert_eq!(calls.lock().unwrap().len(), 2);
+
+        // Every failure is a SenderFault: no retry.
+        let (client, calls) = recording_client(vec![vec!["!a"]]);
+        publish(&client, vec![entry("a", "1")], AwsWriteOptions::default())
+            .await
+            .unwrap_err();
+        assert_eq!(calls.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn attaches_buffered_entries_to_oversize_error() {
+        let (client, calls) = recording_client(Vec::new());
+        let input = vec![
+            entry("0", "a"),
+            entry("1", &"x".repeat(SNS_MAX_BATCH_BYTES + 1)),
+        ];
+        let e = publish(&client, input, AwsWriteOptions::default())
+            .await
+            .unwrap_err();
+        let unsent = e
+            .downcast_ref::<crate::AwsUnsentError<PublishBatchRequestEntry>>()
+            .unwrap();
+        assert_eq!(unsent.failed_messages, [entry("0", "a")]);
+        assert_eq!(
+            unsent.to_string(),
+            "awsSNSPublishBatch entry exceeds 256KiB limit"
+        );
+        assert!(calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn abort_attaches_buffered_entries_without_sending() {
+        let (client, calls) = recording_client(Vec::new());
+        let signal = CancellationToken::new();
+        let options = AwsWriteOptions {
+            signal: Some(signal.clone()),
+            ..Default::default()
+        };
+        let (sender, input) = datastream_core::create_readable_channel(None);
+        let request = client.publish_batch().topic_arn("t");
+        let task = tokio::spawn(aws_sns_publish_message_stream(input, request, options));
+        // 11 entries: one batch of 10 goes out, the 11th stays buffered.
+        for i in 0..11 {
+            sender.send(entry(&i.to_string(), "m")).await.unwrap();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        signal.cancel();
+        let e = task.await.unwrap().unwrap_err();
+        assert_eq!(e.to_string(), "Aborted");
+        let unsent = e
+            .downcast_ref::<crate::AwsUnsentError<PublishBatchRequestEntry>>()
+            .unwrap();
+        assert_eq!(unsent.failed_messages, [entry("10", "m")]);
+        assert_eq!(calls.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]

@@ -5,10 +5,10 @@ use datastream_core::{
 };
 use datastream_csv::{
     csv_coerce_values_stream, csv_detect_delimiters_stream, csv_detect_header_stream,
-    csv_format_stream, csv_inject_header_stream, csv_object_to_array, csv_parse_stream,
+    csv_format_stream, csv_inject_header_stream, csv_object_to_array_stream, csv_parse_stream,
     csv_quoted_parser, csv_remove_empty_rows_stream, csv_remove_malformed_rows_stream,
-    csv_unquoted_parser, CsvCoerceValuesOptions, CsvDetectHeaderOptions, CsvHeadersOptions,
-    CsvInjectHeaderOptions, CsvParseOptions, CsvRemoveEmptyRowsOptions,
+    csv_unquoted_parser, CsvCoerceValuesOptions, CsvDetectHeaderOptions, CsvFormatOptions,
+    CsvHeadersOptions, CsvInjectHeaderOptions, CsvParseOptions, CsvRemoveEmptyRowsOptions,
     CsvRemoveMalformedRowsOptions, LazyString, ParserOptions,
 };
 use proptest::prelude::*;
@@ -65,9 +65,17 @@ fn parse(text: String, cuts: &[usize]) -> (Vec<Value>, Value) {
     (rows, errors.get())
 }
 
+// Round trips need the raw values back, so formula escaping is off.
+fn format_options() -> CsvFormatOptions {
+    CsvFormatOptions {
+        escape_formulae: Some(false),
+        ..Default::default()
+    }
+}
+
 fn format(rows: Vec<Value>) -> String {
     block_on(stream_to_string(
-        csv_format_stream(create_readable_stream(rows), Default::default()),
+        csv_format_stream(create_readable_stream(rows), format_options()),
         None,
     ))
     .unwrap()
@@ -214,7 +222,7 @@ proptest! {
             .iter()
             .map(|row| Value::Object(row.iter().map(|(k, v)| (k.clone(), json!(v))).collect::<Map<_, _>>()))
             .collect();
-        let (stream, _) = csv_coerce_values_stream(create_readable_stream(values.clone()), CsvCoerceValuesOptions::default());
+        let stream = csv_coerce_values_stream(create_readable_stream(values.clone()), CsvCoerceValuesOptions::default());
         let output = block_on(stream_to_array(stream, None)).unwrap();
         prop_assert_eq!(output.len(), values.len());
         for (before, after) in values.iter().zip(&output) {
@@ -227,9 +235,9 @@ proptest! {
     fn fuzz_csv_format_objects_via_compose(input in prop::collection::vec((field(), field(), field()), 1..12)) {
         let headers = vec!["a".to_string(), "b".to_string(), "c".to_string()];
         let objects: Vec<Value> = input.iter().map(|(a, b, c)| json!({"a": a, "b": b, "c": c})).collect();
-        let rows = csv_object_to_array(create_readable_stream(objects), CsvHeadersOptions { headers: headers.clone().into() });
+        let rows = csv_object_to_array_stream(create_readable_stream(objects), CsvHeadersOptions { headers: headers.clone().into() });
         let rows = csv_inject_header_stream(rows, CsvInjectHeaderOptions { header: headers.clone() });
-        let text = block_on(stream_to_string(csv_format_stream(rows, Default::default()), None)).unwrap();
+        let text = block_on(stream_to_string(csv_format_stream(rows, format_options()), None)).unwrap();
         let (output, _) = parse(text, &[]);
         let mut expected = vec![json!(headers)];
         expected.extend(input.iter().map(|(a, b, c)| json!([a, b, c])));

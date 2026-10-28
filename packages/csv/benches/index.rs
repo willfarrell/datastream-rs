@@ -10,7 +10,7 @@ use datastream_core::{
 };
 use datastream_csv::{
     csv_coerce_values_stream, csv_detect_delimiters_stream, csv_detect_header_stream,
-    csv_format_stream, csv_inject_header_stream, csv_object_to_array, csv_parse_stream,
+    csv_format_stream, csv_inject_header_stream, csv_object_to_array_stream, csv_parse_stream,
     csv_remove_empty_rows_stream, csv_remove_malformed_rows_stream, CsvCoerceType,
     CsvCoerceValuesOptions, CsvDetectHeaderOptions, CsvHeadersOptions, CsvInjectHeaderOptions,
     CsvParseOptions, CsvRemoveMalformedRowsOptions, Keys, LazyString,
@@ -80,7 +80,7 @@ fn benches(c: &mut Criterion) {
 
     c.bench_function("csvFormatStream, from objects", |b| {
         b.to_async(&runtime).iter(|| async {
-            let rows = csv_object_to_array(
+            let rows = csv_object_to_array_stream(
                 create_readable_stream(objects.clone()),
                 CsvHeadersOptions {
                     headers: header().into(),
@@ -166,7 +166,7 @@ fn benches(c: &mut Criterion) {
         })
         .collect();
     pipe("csvCoerceValuesStream, auto-coerce", c, &|| {
-        csv_coerce_values_stream(create_readable_stream(auto.clone()), Default::default()).0
+        csv_coerce_values_stream(create_readable_stream(auto.clone()), Default::default())
     });
     let explicit: Vec<Value> = objects
         .iter()
@@ -185,10 +185,8 @@ fn benches(c: &mut Criterion) {
             create_readable_stream(explicit.clone()),
             CsvCoerceValuesOptions {
                 columns: columns.clone(),
-                ..Default::default()
             },
         )
-        .0
     });
 
     pipe("full pipeline", c, &|| {
