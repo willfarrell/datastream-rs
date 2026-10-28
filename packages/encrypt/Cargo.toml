@@ -13,7 +13,7 @@ async-stream.workspace = true
 chacha20poly1305 = "0.10"
 ctr = "0.9"
 datastream-core.workspace = true
-getrandom = "0.2"
+getrandom = "0.4"
 serde_json.workspace = true
 
 [dev-dependencies]
